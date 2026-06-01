@@ -199,6 +199,10 @@ def get_ext_modules():
                                       "numba/_pymodule.h"],
                              **np_compile_args)
 
+    ext_np_strings = Extension(name="numba.np.strings._stringdtype",
+                               sources=["numba/np/strings/_stringdtype.c"],
+                               **np_compile_args)
+
     ext_npyufunc_num_threads = Extension(name="numba.np.ufunc._num_threads",
                                          sources=[
                                              "numba/np/ufunc/_num_threads.c"],
@@ -368,7 +372,8 @@ def get_ext_modules():
                                 include_dirs=["numba"])
 
     ext_modules = [ext_dynfunc, ext_dispatcher, ext_helperlib,
-                   ext_typeconv, ext_np_ufunc, ext_npyufunc_num_threads,
+                   ext_typeconv, ext_np_ufunc, ext_np_strings,
+                   ext_npyufunc_num_threads,
                    ext_mviewbuf, ext_nrt_python, ext_jitclass_box,
                    ext_cuda_extras, ext_devicearray]
 

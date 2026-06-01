@@ -111,6 +111,7 @@ class CPUContext(BaseContext):
         from numba.core import optional, inline_closurecall # noqa F401
         from numba.misc import gdb_hook, literal # noqa F401
         from numba.np import linalg, arraymath, arrayobj # noqa F401
+        from numba.np.strings import _overloads as np_strings # noqa F401
         from numba.np.random import generator_core, generator_methods # noqa F401
         from numba.np.polynomial import polynomial_core, polynomial_functions # noqa F401
         from numba.typed import typeddict, dictimpl # noqa F401

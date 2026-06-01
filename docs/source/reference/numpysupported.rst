@@ -463,6 +463,43 @@ The following reduction functions are supported:
   unsupported)
 * :func:`np.average` (`axis` argument is not supported)
 
+String operations
+-----------------
+
+The following read-only string functions are supported through
+:mod:`numpy.strings` on NumPy 2.x. They support fixed-width byte string
+(``S``), fixed-width Unicode string (``U``), and NumPy 2.x ``StringDType``
+arrays:
+
+* :func:`numpy.strings.equal`
+* :func:`numpy.strings.not_equal`
+* :func:`numpy.strings.greater`
+* :func:`numpy.strings.greater_equal`
+* :func:`numpy.strings.less`
+* :func:`numpy.strings.less_equal`
+* :func:`numpy.strings.count`
+* :func:`numpy.strings.endswith`
+* :func:`numpy.strings.find`
+* :func:`numpy.strings.index`
+* :func:`numpy.strings.rfind`
+* :func:`numpy.strings.rindex`
+* :func:`numpy.strings.startswith`
+* :func:`numpy.strings.str_len`
+* :func:`numpy.strings.isalpha`
+* :func:`numpy.strings.isalnum`
+* :func:`numpy.strings.isdecimal`
+* :func:`numpy.strings.isdigit`
+* :func:`numpy.strings.islower`
+* :func:`numpy.strings.isnumeric`
+* :func:`numpy.strings.isspace`
+* :func:`numpy.strings.istitle`
+* :func:`numpy.strings.isupper`
+
+The same implementation also supports the corresponding :mod:`numpy.char`
+functions for fixed-width ``S`` and ``U`` arrays, preserving NumPy's
+``numpy.char`` comparison semantics. :func:`numpy.char.compare_chararrays` is
+also supported for fixed-width ``S`` and ``U`` arrays.
+
 
 Polynomials
 -----------

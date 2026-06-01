@@ -1,0 +1,2947 @@
+"""Numba overloads for NumPy's np.strings routines."""
+
+from numba.np.strings import JIT_OPTIONS, OPTIONS
+from numba.np.strings._shared import (
+    binary_row_plan, ensure_slice, equal_dispatch, equal_kernel,
+    next_binary_row, next_unary_row, order_dispatch, try_register_pair,
+    unary_row_plan,
+)
+from numba.np.strings._stringdtype_support import (
+    _PACKED_STRING_SIZE, is_stringdtype_array_type,
+    STRINGDTYPE_BOOL_ERROR, STRINGDTYPE_BOOL_TRUE,
+    STRINGDTYPE_ORDER_ERROR, STRINGDTYPE_ORDER_FALSE,
+    STRINGDTYPE_SEARCH_ERROR,
+    stringdtype_acquire_allocator, stringdtype_acquire_allocators,
+    stringdtype_codepoint_len_data, stringdtype_compare_data,
+    stringdtype_compare_na_data,
+    stringdtype_compare_unicode_data, stringdtype_compare_unicode_na_data,
+    stringdtype_compare_utf8_data,
+    stringdtype_count_data, stringdtype_count_na_data,
+    stringdtype_count_unicode_data, stringdtype_count_unicode_na_data,
+    stringdtype_count_utf8_data,
+    stringdtype_data_ptr, stringdtype_endswith_data,
+    stringdtype_endswith_na_data,
+    stringdtype_endswith_unicode_data, stringdtype_endswith_unicode_na_data,
+    stringdtype_endswith_utf8_data,
+    stringdtype_equal_data, stringdtype_equal_na_data,
+    stringdtype_equal_unicode_data, stringdtype_equal_unicode_na_data,
+    stringdtype_equal_utf8_data,
+    stringdtype_find_data, stringdtype_find_na_data,
+    stringdtype_find_unicode_data, stringdtype_find_unicode_na_data,
+    stringdtype_find_utf8_data,
+    stringdtype_free_utf8_span,
+    stringdtype_isalnum_data, stringdtype_isalnum_na_data,
+    stringdtype_isalpha_data, stringdtype_isalpha_na_data,
+    stringdtype_isdecimal_data, stringdtype_isdecimal_na_data,
+    stringdtype_isdigit_data, stringdtype_isdigit_na_data,
+    stringdtype_islower_data, stringdtype_islower_na_data,
+    stringdtype_isnumeric_data, stringdtype_isnumeric_na_data,
+    stringdtype_isspace_data, stringdtype_isspace_na_data,
+    stringdtype_istitle_data, stringdtype_istitle_na_data,
+    stringdtype_isupper_data, stringdtype_isupper_na_data,
+    stringdtype_na_name, stringdtype_not_equal_data,
+    stringdtype_not_equal_na_data,
+    stringdtype_not_equal_unicode_na_data,
+    stringdtype_release_allocator,
+    stringdtype_release_allocators, stringdtype_rfind_data,
+    stringdtype_rfind_na_data,
+    stringdtype_rfind_unicode_data, stringdtype_rfind_unicode_na_data,
+    stringdtype_rfind_utf8_data,
+    stringdtype_startswith_data, stringdtype_startswith_na_data,
+    stringdtype_startswith_unicode_data,
+    stringdtype_startswith_unicode_na_data, stringdtype_startswith_utf8_data,
+    stringdtype_codepoint_len_na_data, stringdtype_unicode_parts,
+    stringdtype_unicode_utf8_span, stringdtype_unicode_valid,
+    stringdtype_utf8_search_slice, stringdtype_utf8_slice,
+    utf8_count_stringdtype_sliced_data,
+    utf8_count_stringdtype_sliced_na_data,
+    utf8_endswith_stringdtype_sliced_data,
+    utf8_endswith_stringdtype_sliced_na_data,
+    utf8_find_stringdtype_sliced_data, utf8_find_stringdtype_sliced_na_data,
+    utf8_rfind_stringdtype_sliced_data, utf8_rfind_stringdtype_sliced_na_data,
+    utf8_startswith_stringdtype_sliced_data,
+    utf8_startswith_stringdtype_sliced_na_data,
+)
+from numba.np.strings._kernels import (
+    equal, equal_sub32_bytes, equal_sub32_unicode, greater, greater_equal,
+)
+from numba.np.strings._char_compat import (
+    _CHAR_INFO_FUNCTIONS, _fixed_width_equal_nd_impl,
+    _fixed_width_order_nd_impl, ov_char_count, ov_char_endswith,
+    ov_char_find, ov_char_index, ov_char_isalnum, ov_char_isalpha,
+    ov_char_isdecimal, ov_char_isdigit, ov_char_islower, ov_char_isnumeric,
+    ov_char_isspace, ov_char_istitle, ov_char_isupper, ov_char_rfind,
+    ov_char_rindex, ov_char_startswith, ov_char_str_len,
+)
+from numba.core import types
+from numba.core.errors import NumbaValueError
+from numba.core.typing.templates import AttributeTemplate
+from numba.extending import infer_getattr, overload, register_jitable
+from numba import literally
+import numpy as np
+
+
+_STRINGS = getattr(np, 'strings', None)
+_NUMPY_VERSION = tuple(int(part) for part in np.__version__.split('.')[:2])
+_NUMPY_LT_2_1 = _NUMPY_VERSION < (2, 1)
+_SDT_ISALPHA = 1
+_SDT_ISALNUM = 2
+_SDT_ISDECIMAL = 3
+_SDT_ISDIGIT = 4
+_SDT_ISNUMERIC = 5
+_SDT_ISSPACE = 6
+_SDT_ISLOWER = 7
+_SDT_ISUPPER = 8
+_SDT_ISTITLE = 9
+
+
+def _unsupported_stringdtype_loop(op):
+    def impl(value, pattern, start=0, end=None):
+        raise TypeError(
+            f"ufunc '{op}' did not contain a loop with signature "
+            "matching types")
+
+    return impl
+
+
+def _validate_stringdtype_array(value):
+    if value.ndim > 1:
+        raise NumbaValueError('unsupported StringDType array dimensionality')
+
+
+def _is_unicode_scalar(value):
+    return isinstance(value, types.UnicodeType)
+
+
+def _is_unicode_array_scalar(value):
+    return isinstance(value, types.Array) and value.ndim == 0 \
+        and isinstance(value.dtype, types.UnicodeCharSeq) \
+        and value.dtype.count
+
+
+def _is_unicode_array(value):
+    return isinstance(value, types.Array) \
+        and isinstance(value.dtype, types.UnicodeCharSeq) \
+        and value.dtype.count
+
+
+def _is_bytes_array(value):
+    return isinstance(value, types.Array) \
+        and isinstance(value.dtype, types.CharSeq) \
+        and value.dtype.count
+
+
+def _is_bytes_scalar(value):
+    return isinstance(value, (types.Bytes, types.CharSeq))
+
+
+def _is_none(value):
+    return isinstance(value, types.NoneType)
+
+
+def _is_unicode_scalar_like(value):
+    return _is_unicode_scalar(value) or _is_unicode_array_scalar(value)
+
+
+def _validate_unicode_array(value):
+    if value.ndim > 1:
+        raise NumbaValueError('unsupported unicode array dimensionality')
+
+
+def _stringdtype_na_kind(value):
+    if is_stringdtype_array_type(value):
+        return value.dtype.na_kind
+    return 0
+
+
+def _stringdtype_na_name_type(value):
+    if is_stringdtype_array_type(value):
+        return value.dtype.na_name
+    return b''
+
+
+def _compatible_stringdtype_na(left, right):
+    left_kind = _stringdtype_na_kind(left)
+    right_kind = _stringdtype_na_kind(right)
+    if left_kind == 0 or right_kind == 0:
+        return True
+    return left_kind == right_kind \
+        and _stringdtype_na_name_type(left) == _stringdtype_na_name_type(right)
+
+
+def _has_stringdtype_na(*values):
+    for value in values:
+        if _stringdtype_na_kind(value) != 0:
+            return True
+    return False
+
+
+def _unicode_scalar_value(value):
+    return value
+
+
+@overload(_unicode_scalar_value, **OPTIONS)
+def ov_unicode_scalar_value(value):
+    if _is_unicode_array_scalar(value):
+        def impl(value):
+            return str(value[()])
+        return impl
+    if _is_unicode_scalar(value):
+        def impl(value):
+            return value
+        return impl
+    if isinstance(value, types.UnicodeCharSeq):
+        def impl(value):
+            return str(value)
+        return impl
+
+
+def _has_string_operand(left, right):
+    string_types = (types.Bytes, types.CharSeq,
+                    types.UnicodeType, types.UnicodeCharSeq)
+    if isinstance(left, types.Array):
+        if isinstance(left.dtype, string_types) and left.dtype.count:
+            return True
+    elif isinstance(left, string_types):
+        return True
+
+    if isinstance(right, types.Array):
+        if isinstance(right.dtype, string_types) and right.dtype.count:
+            return True
+    elif isinstance(right, string_types):
+        return True
+    return False
+
+
+def _numpy_fallback(op):
+    if op == 'equal':
+        def impl(left, right):
+            return np.equal(left, right)
+    elif op == 'not_equal':
+        def impl(left, right):
+            return np.not_equal(left, right)
+    elif op == 'greater_equal':
+        def impl(left, right):
+            return np.greater_equal(left, right)
+    elif op == 'greater':
+        def impl(left, right):
+            return np.greater(left, right)
+    elif op == 'less':
+        def impl(left, right):
+            return np.less(left, right)
+    else:
+        def impl(left, right):
+            return np.less_equal(left, right)
+    return impl
+
+
+@register_jitable(**JIT_OPTIONS)
+def _bytes_equal_array_array(left, right, invert):
+    if left.size != right.size:
+        raise ValueError('shape mismatch: objects cannot be broadcast to a '
+                         'single shape.  Mismatch is between arg 0 and arg 1.')
+    result = np.empty(left.size, np.bool_)
+    for i in range(left.size):
+        result[i] = (left[i] == right[i]) != invert
+    return result
+
+
+@register_jitable(**JIT_OPTIONS)
+def _bytes_equal_array_scalar(values, value, invert):
+    result = np.empty(values.size, np.bool_)
+    for i in range(values.size):
+        result[i] = (values[i] == value) != invert
+    return result
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_step(value):
+    return value.strides[0] // _PACKED_STRING_SIZE
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_1d_broadcast_size(left_ndim, left_size, right_ndim,
+                                   right_size):
+    left_single = left_ndim == 0 or left_size == 1
+    right_single = right_ndim == 0 or right_size == 1
+
+    if left_size == right_size:
+        return left_size, left_single, right_single
+    if left_single:
+        return right_size, True, right_single
+    if right_single:
+        return left_size, left_single, True
+
+    raise ValueError('shape mismatch: objects cannot be broadcast '
+                     'to a single shape')
+
+
+@register_jitable(**JIT_OPTIONS)
+def _order_result(cmp_result, op_code):
+    if op_code == 0:
+        return cmp_result > 0
+    if op_code == 1:
+        return cmp_result >= 0
+    if op_code == 2:
+        return cmp_result < 0
+    return cmp_result <= 0
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_order_result(cmp_result, op_code):
+    if cmp_result == STRINGDTYPE_ORDER_ERROR:
+        raise ValueError(
+            'StringDType ordering is not supported for this null value')
+    if cmp_result == STRINGDTYPE_ORDER_FALSE:
+        return False
+    return _order_result(cmp_result, op_code)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_binary_bool_na_value(left_data, left_index, left_allocator,
+                                      right_data, right_index,
+                                      right_allocator, left_na_kind, left_na,
+                                      right_na_kind, right_na, op_code):
+    if op_code < 2:
+        if op_code == 1:
+            return int(stringdtype_not_equal_na_data(
+                left_data, left_index, left_allocator,
+                left_na_kind, left_na[0], left_na[1],
+                right_data, right_index, right_allocator,
+                right_na_kind, right_na[0], right_na[1]))
+        return int(stringdtype_equal_na_data(
+            left_data, left_index, left_allocator,
+            left_na_kind, left_na[0], left_na[1],
+            right_data, right_index, right_allocator,
+            right_na_kind, right_na[0], right_na[1]))
+
+    cmp_result = stringdtype_compare_na_data(
+        left_data, left_index, left_allocator,
+        left_na_kind, left_na[0], left_na[1],
+        right_data, right_index, right_allocator,
+        right_na_kind, right_na[0], right_na[1])
+    if cmp_result == STRINGDTYPE_ORDER_ERROR:
+        return -1
+    if cmp_result == STRINGDTYPE_ORDER_FALSE:
+        return 0
+    return int(_order_result(cmp_result, op_code - 2))
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_binary_bool_plain_value(left_data, left_index, left_allocator,
+                                         right_data, right_index,
+                                         right_allocator, op_code):
+    if op_code < 2:
+        if op_code == 1:
+            return stringdtype_not_equal_data(
+                left_data, left_index, left_allocator,
+                right_data, right_index, right_allocator)
+        return stringdtype_equal_data(
+            left_data, left_index, left_allocator,
+            right_data, right_index, right_allocator)
+
+    cmp_result = stringdtype_compare_data(
+        left_data, left_index, left_allocator,
+        right_data, right_index, right_allocator)
+    if op_code == 2:
+        return cmp_result > 0
+    if op_code == 3:
+        return cmp_result >= 0
+    if op_code == 4:
+        return cmp_result < 0
+    return cmp_result <= 0
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_pair_bool_scalar(left, right, use_na, left_na_kind,
+                                  right_na_kind, op_code):
+    allocators = stringdtype_acquire_allocators(left, right)
+    left_data = stringdtype_data_ptr(left)
+    right_data = stringdtype_data_ptr(right)
+    if use_na:
+        left_na = stringdtype_na_name(left)
+        right_na = stringdtype_na_name(right)
+        value = _stringdtype_binary_bool_na_value(
+            left_data, 0, allocators[0],
+            right_data, 0, allocators[1],
+            left_na_kind, left_na, right_na_kind, right_na, op_code)
+    else:
+        value = int(_stringdtype_binary_bool_plain_value(
+            left_data, 0, allocators[0],
+            right_data, 0, allocators[1], op_code))
+    stringdtype_release_allocators(allocators)
+    if value < 0:
+        raise ValueError(
+            'StringDType ordering is not supported for this null value')
+    return bool(value)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_bool_scalar(value, scalar, use_na, na_kind,
+                                     scalar_left, op_code):
+    scalar_value = _unicode_scalar_value(scalar)
+    if not stringdtype_unicode_valid(scalar_value):
+        raise TypeError('Invalid unicode code point found')
+    scalar_parts = stringdtype_unicode_parts(scalar_value)
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+
+    if op_code < 2:
+        if use_na:
+            na_name = stringdtype_na_name(value)
+            if op_code == 1:
+                result = stringdtype_not_equal_unicode_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1],
+                    scalar_value, scalar_parts[0], scalar_parts[1],
+                    scalar_left)
+            else:
+                result = stringdtype_equal_unicode_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1],
+                    scalar_value, scalar_parts[0], scalar_parts[1],
+                    scalar_left)
+        elif scalar_parts[1] > _PACKED_STRING_SIZE:
+            span = stringdtype_unicode_utf8_span(
+                scalar_value, scalar_parts[0], scalar_parts[1])
+            result = stringdtype_equal_utf8_data(
+                data, 0, allocator, span[0], span[1])
+            stringdtype_free_utf8_span(span[0], span[2])
+            if op_code == 1:
+                result = not result
+        else:
+            result = stringdtype_equal_unicode_data(
+                data, 0, allocator,
+                scalar_value, scalar_parts[0], scalar_parts[1])
+            if op_code == 1:
+                result = not result
+
+        stringdtype_release_allocator(allocator)
+        return result
+
+    if use_na:
+        na_name = stringdtype_na_name(value)
+        cmp_result = stringdtype_compare_unicode_na_data(
+            data, 0, allocator, na_kind, na_name[0], na_name[1],
+            scalar_value, scalar_parts[0], scalar_parts[1], scalar_left)
+    elif scalar_parts[1] > _PACKED_STRING_SIZE:
+        span = stringdtype_unicode_utf8_span(
+            scalar_value, scalar_parts[0], scalar_parts[1])
+        cmp_result = stringdtype_compare_utf8_data(
+            data, 0, allocator, span[0], span[1])
+        stringdtype_free_utf8_span(span[0], span[2])
+    else:
+        cmp_result = stringdtype_compare_unicode_data(
+            data, 0, allocator,
+            scalar_value, scalar_parts[0], scalar_parts[1])
+    stringdtype_release_allocator(allocator)
+
+    if scalar_left and cmp_result != STRINGDTYPE_ORDER_ERROR \
+            and cmp_result != STRINGDTYPE_ORDER_FALSE:
+        cmp_result = -cmp_result
+    if use_na:
+        return _stringdtype_order_result(cmp_result, op_code - 2)
+    return _order_result(cmp_result, op_code - 2)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_binary_bool_nd(left, right, use_na, left_na_kind,
+                                right_na_kind, op_code):
+    if left.ndim <= 1 and right.ndim <= 1:
+        total, left_single, right_single = _stringdtype_1d_broadcast_size(
+            left.ndim, left.size, right.ndim, right.size)
+        result = np.empty(total, np.bool_)
+        if total == 0:
+            return result
+
+        allocators = stringdtype_acquire_allocators(left, right)
+        left_allocator = allocators[0]
+        right_allocator = allocators[1]
+        left_data = stringdtype_data_ptr(left)
+        right_data = stringdtype_data_ptr(right)
+        left_step = 1 if left.ndim == 0 else _stringdtype_step(left)
+        right_step = 1 if right.ndim == 0 else _stringdtype_step(right)
+        bad_order = False
+        if use_na:
+            left_na = stringdtype_na_name(left)
+            right_na = stringdtype_na_name(right)
+        else:
+            left_na = (0, left_data)
+            right_na = (0, right_data)
+        for i in range(total):
+            left_index = 0 if left_single else i * left_step
+            right_index = 0 if right_single else i * right_step
+            if use_na:
+                value = _stringdtype_binary_bool_na_value(
+                    left_data, left_index, left_allocator,
+                    right_data, right_index, right_allocator,
+                    left_na_kind, left_na, right_na_kind, right_na, op_code)
+                if value < 0:
+                    bad_order = True
+                    break
+                result[i] = bool(value)
+            else:
+                result[i] = _stringdtype_binary_bool_plain_value(
+                    left_data, left_index, left_allocator,
+                    right_data, right_index, right_allocator, op_code)
+        stringdtype_release_allocators(allocators)
+        if bad_order:
+            raise ValueError(
+                'StringDType ordering is not supported for this null value')
+        return result
+
+    out_shape_tuple, out_shape, left_steps, right_steps, out_ndim, total = \
+        binary_row_plan(left, right, _PACKED_STRING_SIZE)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocators = stringdtype_acquire_allocators(left, right)
+    left_allocator = allocators[0]
+    right_allocator = allocators[1]
+    left_data = stringdtype_data_ptr(left)
+    right_data = stringdtype_data_ptr(right)
+    bad_order = False
+    if use_na:
+        left_na = stringdtype_na_name(left)
+        right_na = stringdtype_na_name(right)
+    else:
+        left_na = (0, left_data)
+        right_na = (0, right_data)
+
+    inner = out_shape[out_ndim - 1]
+    inner_left_step = left_steps[out_ndim - 1]
+    inner_right_step = right_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_left_index = 0
+    row_right_index = 0
+    while result_i < total:
+        left_index = row_left_index
+        right_index = row_right_index
+        for _ in range(inner):
+            if use_na:
+                value = _stringdtype_binary_bool_na_value(
+                    left_data, left_index, left_allocator,
+                    right_data, right_index, right_allocator,
+                    left_na_kind, left_na, right_na_kind, right_na, op_code)
+                if value < 0:
+                    bad_order = True
+                    break
+                result[result_i] = bool(value)
+            else:
+                result[result_i] = _stringdtype_binary_bool_plain_value(
+                    left_data, left_index, left_allocator,
+                    right_data, right_index, right_allocator, op_code)
+            result_i += 1
+            left_index += inner_left_step
+            right_index += inner_right_step
+        if bad_order:
+            break
+
+        row_left_index, row_right_index = next_binary_row(
+            coords, out_shape, left_steps, right_steps, out_ndim,
+            row_left_index, row_right_index)
+
+    stringdtype_release_allocators(allocators)
+    if bad_order:
+        raise ValueError(
+            'StringDType ordering is not supported for this null value')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_bool_nd(value, scalar, use_na, na_kind, scalar_left,
+                                 op_code):
+    out_shape_tuple, out_shape, value_steps, out_ndim, total = \
+        unary_row_plan(value, _PACKED_STRING_SIZE)
+    scalar_value = _unicode_scalar_value(scalar)
+    if not stringdtype_unicode_valid(scalar_value):
+        raise TypeError('Invalid unicode code point found')
+    scalar_parts = stringdtype_unicode_parts(scalar_value)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+    bad_order = False
+    if use_na:
+        na_name = stringdtype_na_name(value)
+    elif scalar_parts[1] > _PACKED_STRING_SIZE:
+        scalar_span = stringdtype_unicode_utf8_span(
+            scalar_value, scalar_parts[0], scalar_parts[1])
+
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        for _ in range(inner):
+            if op_code < 2:
+                if use_na:
+                    if op_code == 1:
+                        result[result_i] = \
+                            stringdtype_not_equal_unicode_na_data(
+                                data, value_index, allocator, na_kind,
+                                na_name[0], na_name[1], scalar_value,
+                                scalar_parts[0], scalar_parts[1], scalar_left)
+                    else:
+                        result[result_i] = stringdtype_equal_unicode_na_data(
+                            data, value_index, allocator, na_kind, na_name[0],
+                            na_name[1], scalar_value, scalar_parts[0],
+                            scalar_parts[1], scalar_left)
+                elif scalar_parts[1] > _PACKED_STRING_SIZE:
+                    equal_result = stringdtype_equal_utf8_data(
+                        data, value_index, allocator, scalar_span[0],
+                        scalar_span[1])
+                    result[result_i] = not equal_result \
+                        if op_code == 1 else equal_result
+                else:
+                    equal_result = stringdtype_equal_unicode_data(
+                        data, value_index, allocator, scalar_value,
+                        scalar_parts[0], scalar_parts[1])
+                    result[result_i] = not equal_result \
+                        if op_code == 1 else equal_result
+            elif use_na:
+                cmp_result = stringdtype_compare_unicode_na_data(
+                    data, value_index, allocator, na_kind, na_name[0],
+                    na_name[1], scalar_value, scalar_parts[0],
+                    scalar_parts[1], scalar_left)
+                if cmp_result == STRINGDTYPE_ORDER_ERROR:
+                    bad_order = True
+                    break
+                if cmp_result == STRINGDTYPE_ORDER_FALSE:
+                    result[result_i] = False
+                else:
+                    if scalar_left:
+                        cmp_result = -cmp_result
+                    result[result_i] = _order_result(cmp_result, op_code - 2)
+            elif scalar_parts[1] > _PACKED_STRING_SIZE:
+                cmp_result = stringdtype_compare_utf8_data(
+                    data, value_index, allocator, scalar_span[0],
+                    scalar_span[1])
+                if scalar_left:
+                    cmp_result = -cmp_result
+                result[result_i] = _order_result(cmp_result, op_code - 2)
+            else:
+                cmp_result = stringdtype_compare_unicode_data(
+                    data, value_index, allocator, scalar_value,
+                    scalar_parts[0], scalar_parts[1])
+                if scalar_left:
+                    cmp_result = -cmp_result
+                result[result_i] = _order_result(cmp_result, op_code - 2)
+            result_i += 1
+            value_index += inner_value_step
+        if bad_order:
+            break
+
+        row_value_index = next_unary_row(
+            coords, out_shape, value_steps, out_ndim, row_value_index)
+
+    stringdtype_release_allocator(allocator)
+    if not use_na and scalar_parts[1] > _PACKED_STRING_SIZE:
+        stringdtype_free_utf8_span(scalar_span[0], scalar_span[2])
+    if bad_order:
+        raise ValueError(
+            'StringDType ordering is not supported for this null value')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_affix_nd(value, pattern, use_na, na_kind, start, end,
+                                  suffix):
+    out_shape_tuple, out_shape, value_steps, out_ndim, total = \
+        unary_row_plan(value, _PACKED_STRING_SIZE)
+    pattern_value = _unicode_scalar_value(pattern)
+    if not stringdtype_unicode_valid(pattern_value):
+        raise TypeError('Invalid unicode code point found')
+    pattern_parts = stringdtype_unicode_parts(pattern_value)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+    bad_null = False
+    if use_na:
+        na_name = stringdtype_na_name(value)
+    elif pattern_parts[1] > _PACKED_STRING_SIZE:
+        pattern_span = stringdtype_unicode_utf8_span(
+            pattern_value, pattern_parts[0], pattern_parts[1])
+
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        for _ in range(inner):
+            if use_na:
+                found = stringdtype_endswith_unicode_na_data(
+                    data, value_index, allocator, na_kind, na_name[0],
+                    na_name[1], pattern_value, pattern_parts[0],
+                    pattern_parts[1], start, end) if suffix \
+                    else stringdtype_startswith_unicode_na_data(
+                        data, value_index, allocator, na_kind, na_name[0],
+                        na_name[1], pattern_value, pattern_parts[0],
+                        pattern_parts[1], start, end)
+                if found == STRINGDTYPE_BOOL_ERROR:
+                    bad_null = True
+                    break
+                result[result_i] = found == STRINGDTYPE_BOOL_TRUE
+            elif pattern_parts[1] > _PACKED_STRING_SIZE:
+                result[result_i] = _stringdtype_utf8_affix(
+                    data, value_index, allocator, pattern_span[0],
+                    pattern_span[1], start, end, suffix)
+            else:
+                result[result_i] = _stringdtype_unicode_affix(
+                    data, value_index, allocator, pattern_value,
+                    pattern_parts[0], pattern_parts[1], start, end, suffix)
+            result_i += 1
+            value_index += inner_value_step
+        if bad_null:
+            break
+
+        row_value_index = next_unary_row(
+            coords, out_shape, value_steps, out_ndim, row_value_index)
+
+    stringdtype_release_allocator(allocator)
+    if not use_na and pattern_parts[1] > _PACKED_STRING_SIZE:
+        stringdtype_free_utf8_span(pattern_span[0], pattern_span[2])
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _unicode_stringdtype_affix_nd(value, pattern, use_na, na_kind, start, end,
+                                  suffix):
+    out_shape_tuple, out_shape, pattern_steps, out_ndim, total = \
+        unary_row_plan(pattern, _PACKED_STRING_SIZE)
+    value_value = _unicode_scalar_value(value)
+    if not stringdtype_unicode_valid(value_value):
+        raise TypeError('Invalid unicode code point found')
+    value_parts = stringdtype_unicode_parts(value_value)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    value_span = stringdtype_unicode_utf8_span(
+        value_value, value_parts[0], value_parts[1])
+    slice_parts = stringdtype_utf8_slice(value_span[0], value_span[1],
+                                         start, end)
+    allocator = stringdtype_acquire_allocator(pattern)
+    data = stringdtype_data_ptr(pattern)
+    bad_null = False
+    if use_na:
+        na_name = stringdtype_na_name(pattern)
+
+    inner = out_shape[out_ndim - 1]
+    inner_pattern_step = pattern_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_pattern_index = 0
+    while result_i < total:
+        pattern_index = row_pattern_index
+        for _ in range(inner):
+            if use_na:
+                found = utf8_endswith_stringdtype_sliced_na_data(
+                    value_span[0], slice_parts[0], slice_parts[1],
+                    slice_parts[2], data, pattern_index, allocator,
+                    na_kind, na_name[0], na_name[1], True) if suffix \
+                    else utf8_startswith_stringdtype_sliced_na_data(
+                        value_span[0], slice_parts[0], slice_parts[1],
+                        slice_parts[2], data, pattern_index, allocator,
+                        na_kind, na_name[0], na_name[1], True)
+                if found == STRINGDTYPE_BOOL_ERROR:
+                    bad_null = True
+                    break
+                result[result_i] = found == STRINGDTYPE_BOOL_TRUE
+            else:
+                result[result_i] = _utf8_stringdtype_affix(
+                    value_span[0], slice_parts[0], slice_parts[1],
+                    slice_parts[2], data, pattern_index, allocator, suffix)
+            result_i += 1
+            pattern_index += inner_pattern_step
+        if bad_null:
+            break
+
+        row_pattern_index = next_unary_row(
+            coords, out_shape, pattern_steps, out_ndim, row_pattern_index)
+
+    stringdtype_release_allocator(allocator)
+    stringdtype_free_utf8_span(value_span[0], value_span[2])
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_search_nd(value, pattern, use_na, na_kind, start, end,
+                                   search_op, raise_not_found):
+    out_shape_tuple, out_shape, value_steps, out_ndim, total = \
+        unary_row_plan(value, _PACKED_STRING_SIZE)
+    pattern_value = _unicode_scalar_value(pattern)
+    if not stringdtype_unicode_valid(pattern_value):
+        raise TypeError('Invalid unicode code point found')
+    pattern_parts = stringdtype_unicode_parts(pattern_value)
+    result = np.empty(total, np.int64)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+    bad_null = False
+    not_found = False
+    if use_na:
+        na_name = stringdtype_na_name(value)
+    elif pattern_parts[1] > _PACKED_STRING_SIZE:
+        pattern_span = stringdtype_unicode_utf8_span(
+            pattern_value, pattern_parts[0], pattern_parts[1])
+
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        for _ in range(inner):
+            if use_na:
+                if search_op == 0:
+                    found = stringdtype_find_unicode_na_data(
+                        data, value_index, allocator, na_kind, na_name[0],
+                        na_name[1], pattern_value, pattern_parts[0],
+                        pattern_parts[1], start, end)
+                elif search_op == 1:
+                    found = stringdtype_rfind_unicode_na_data(
+                        data, value_index, allocator, na_kind, na_name[0],
+                        na_name[1], pattern_value, pattern_parts[0],
+                        pattern_parts[1], start, end)
+                else:
+                    found = stringdtype_count_unicode_na_data(
+                        data, value_index, allocator, na_kind, na_name[0],
+                        na_name[1], pattern_value, pattern_parts[0],
+                        pattern_parts[1], start, end)
+            elif pattern_parts[1] > _PACKED_STRING_SIZE:
+                found = _stringdtype_utf8_search(
+                    data, value_index, allocator, pattern_span[0],
+                    pattern_span[1], start, end, search_op)
+            else:
+                found = _stringdtype_unicode_search(
+                    data, value_index, allocator, pattern_value,
+                    pattern_parts[0], pattern_parts[1], start, end,
+                    search_op)
+            if found == STRINGDTYPE_SEARCH_ERROR:
+                bad_null = True
+                break
+            if raise_not_found and found < 0:
+                not_found = True
+                break
+            result[result_i] = found
+            result_i += 1
+            value_index += inner_value_step
+        if bad_null or not_found:
+            break
+
+        row_value_index = next_unary_row(
+            coords, out_shape, value_steps, out_ndim, row_value_index)
+
+    stringdtype_release_allocator(allocator)
+    if not use_na and pattern_parts[1] > _PACKED_STRING_SIZE:
+        stringdtype_free_utf8_span(pattern_span[0], pattern_span[2])
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    if not_found:
+        raise ValueError('substring not found')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _unicode_stringdtype_search_nd(value, pattern, use_na, na_kind, start, end,
+                                   search_op, raise_not_found):
+    out_shape_tuple, out_shape, pattern_steps, out_ndim, total = \
+        unary_row_plan(pattern, _PACKED_STRING_SIZE)
+    value_value = _unicode_scalar_value(value)
+    if not stringdtype_unicode_valid(value_value):
+        raise TypeError('Invalid unicode code point found')
+    value_parts = stringdtype_unicode_parts(value_value)
+    result = np.empty(total, np.int64)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    value_span = stringdtype_unicode_utf8_span(
+        value_value, value_parts[0], value_parts[1])
+    slice_parts = stringdtype_utf8_search_slice(value_span[0], value_span[1],
+                                                start, end)
+    allocator = stringdtype_acquire_allocator(pattern)
+    data = stringdtype_data_ptr(pattern)
+    bad_null = False
+    not_found = False
+    if use_na:
+        na_name = stringdtype_na_name(pattern)
+
+    inner = out_shape[out_ndim - 1]
+    inner_pattern_step = pattern_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_pattern_index = 0
+    while result_i < total:
+        pattern_index = row_pattern_index
+        for _ in range(inner):
+            if use_na:
+                if search_op == 0:
+                    found = utf8_find_stringdtype_sliced_na_data(
+                        value_span[0], slice_parts[0], slice_parts[1],
+                        slice_parts[2], slice_parts[3], slice_parts[4],
+                        data, pattern_index, allocator, na_kind, na_name[0],
+                        na_name[1], True)
+                elif search_op == 1:
+                    found = utf8_rfind_stringdtype_sliced_na_data(
+                        value_span[0], slice_parts[0], slice_parts[1],
+                        slice_parts[2], slice_parts[3], slice_parts[4],
+                        data, pattern_index, allocator, na_kind, na_name[0],
+                        na_name[1], True)
+                else:
+                    found = utf8_count_stringdtype_sliced_na_data(
+                        value_span[0], slice_parts[0], slice_parts[1],
+                        slice_parts[2], slice_parts[3], slice_parts[4],
+                        data, pattern_index, allocator, na_kind, na_name[0],
+                        na_name[1], True)
+            else:
+                found = _utf8_stringdtype_search(
+                    value_span[0], slice_parts[0], slice_parts[1],
+                    slice_parts[2], slice_parts[3], slice_parts[4],
+                    data, pattern_index, allocator, search_op)
+            if found == STRINGDTYPE_SEARCH_ERROR:
+                bad_null = True
+                break
+            if raise_not_found and found < 0:
+                not_found = True
+                break
+            result[result_i] = found
+            result_i += 1
+            pattern_index += inner_pattern_step
+        if bad_null or not_found:
+            break
+
+        row_pattern_index = next_unary_row(
+            coords, out_shape, pattern_steps, out_ndim, row_pattern_index)
+
+    stringdtype_release_allocator(allocator)
+    stringdtype_free_utf8_span(value_span[0], value_span[2])
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    if not_found:
+        raise ValueError('substring not found')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_predicate_data(data, index, allocator, na_kind, na_name,
+                                op):
+    if na_kind != 0:
+        if op == _SDT_ISALPHA:
+            return stringdtype_isalpha_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISALNUM:
+            return stringdtype_isalnum_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISDECIMAL:
+            return stringdtype_isdecimal_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISDIGIT:
+            return stringdtype_isdigit_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISNUMERIC:
+            return stringdtype_isnumeric_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISSPACE:
+            return stringdtype_isspace_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISLOWER:
+            return stringdtype_islower_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        if op == _SDT_ISUPPER:
+            return stringdtype_isupper_na_data(
+                data, index, allocator, na_kind, na_name[0], na_name[1])
+        return stringdtype_istitle_na_data(
+            data, index, allocator, na_kind, na_name[0], na_name[1])
+
+    if op == _SDT_ISALPHA:
+        return int(stringdtype_isalpha_data(data, index, allocator))
+    if op == _SDT_ISALNUM:
+        return int(stringdtype_isalnum_data(data, index, allocator))
+    if op == _SDT_ISDECIMAL:
+        return int(stringdtype_isdecimal_data(data, index, allocator))
+    if op == _SDT_ISDIGIT:
+        return int(stringdtype_isdigit_data(data, index, allocator))
+    if op == _SDT_ISNUMERIC:
+        return int(stringdtype_isnumeric_data(data, index, allocator))
+    if op == _SDT_ISSPACE:
+        return int(stringdtype_isspace_data(data, index, allocator))
+    if op == _SDT_ISLOWER:
+        return int(stringdtype_islower_data(data, index, allocator))
+    if op == _SDT_ISUPPER:
+        return int(stringdtype_isupper_data(data, index, allocator))
+    return int(stringdtype_istitle_data(data, index, allocator))
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_predicate_error(op):
+    if op == _SDT_ISALPHA:
+        raise ValueError(
+            'Cannot use the isalpha function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISALNUM:
+        raise ValueError(
+            'Cannot use the isalnum function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISDECIMAL:
+        raise ValueError(
+            'Cannot use the isdecimal function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISDIGIT:
+        raise ValueError(
+            'Cannot use the isdigit function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISNUMERIC:
+        raise ValueError(
+            'Cannot use the isnumeric function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISSPACE:
+        raise ValueError(
+            'Cannot use the isspace function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISLOWER:
+        raise ValueError(
+            'Cannot use the islower function with a null that is not a '
+            'nan-like value')
+    if op == _SDT_ISUPPER:
+        raise ValueError(
+            'Cannot use the isupper function with a null that is not a '
+            'nan-like value')
+    raise ValueError(
+        'Cannot use the istitle function with a null that is not a nan-like '
+        'value')
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_predicate_nd(value, na_kind, op):
+    out_shape_tuple, out_shape, value_steps, out_ndim, total = \
+        unary_row_plan(value, _PACKED_STRING_SIZE)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+    if na_kind != 0:
+        na_name = stringdtype_na_name(value)
+    else:
+        na_name = (0, data)
+    null_string = False
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        for _ in range(inner):
+            predicate = _stringdtype_predicate_data(
+                data, value_index, allocator, na_kind, na_name, op)
+            if predicate < 0:
+                null_string = True
+                predicate = 0
+            result[result_i] = bool(predicate)
+            result_i += 1
+            value_index += inner_value_step
+
+        row_value_index = next_unary_row(
+            coords, out_shape, value_steps, out_ndim, row_value_index)
+
+    stringdtype_release_allocator(allocator)
+    if null_string:
+        _stringdtype_predicate_error(op)
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_str_len_nd(value, na_kind):
+    if value.ndim == 1:
+        result = np.empty(value.size, np.int64)
+        if value.size == 0:
+            return result
+
+        allocator = stringdtype_acquire_allocator(value)
+        data = stringdtype_data_ptr(value)
+        step = _stringdtype_step(value)
+        if na_kind != 0:
+            na_name = stringdtype_na_name(value)
+        null_string = False
+        for i in range(value.size):
+            index = i * step
+            if na_kind != 0:
+                length = stringdtype_codepoint_len_na_data(
+                    data, index, allocator, na_kind, na_name[0], na_name[1])
+            else:
+                length = stringdtype_codepoint_len_data(
+                    data, index, allocator)
+            if length < 0:
+                null_string = True
+                length = 0
+            result[i] = length
+        stringdtype_release_allocator(allocator)
+        if null_string:
+            raise ValueError('The length of a null string is undefined')
+        return result
+
+    out_shape_tuple, out_shape, value_steps, out_ndim, total = \
+        unary_row_plan(value, _PACKED_STRING_SIZE)
+    result = np.empty(total, np.int64)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocator = stringdtype_acquire_allocator(value)
+    data = stringdtype_data_ptr(value)
+    if na_kind != 0:
+        na_name = stringdtype_na_name(value)
+    else:
+        na_name = (0, data)
+    null_string = False
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        for _ in range(inner):
+            if na_kind != 0:
+                length = stringdtype_codepoint_len_na_data(
+                    data, value_index, allocator, na_kind, na_name[0],
+                    na_name[1])
+            else:
+                length = stringdtype_codepoint_len_data(
+                    data, value_index, allocator)
+            if length < 0:
+                null_string = True
+                length = 0
+            result[result_i] = length
+            result_i += 1
+            value_index += inner_value_step
+
+        row_value_index = next_unary_row(
+            coords, out_shape, value_steps, out_ndim, row_value_index)
+
+    stringdtype_release_allocator(allocator)
+    if null_string:
+        raise ValueError('The length of a null string is undefined')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_affix_nd(value, pattern, use_na, value_na_kind,
+                          pattern_na_kind, pattern_empty_null, start, end,
+                          suffix):
+    out_shape_tuple, out_shape, value_steps, pattern_steps, out_ndim, total = \
+        binary_row_plan(value, pattern, _PACKED_STRING_SIZE)
+    result = np.empty(total, np.bool_)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocators = stringdtype_acquire_allocators(value, pattern)
+    value_allocator = allocators[0]
+    pattern_allocator = allocators[1]
+    value_data = stringdtype_data_ptr(value)
+    pattern_data = stringdtype_data_ptr(pattern)
+    bad_null = False
+    if use_na:
+        value_na = stringdtype_na_name(value)
+        pattern_na = stringdtype_na_name(pattern)
+
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    inner_pattern_step = pattern_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    row_pattern_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        pattern_index = row_pattern_index
+        for _ in range(inner):
+            if use_na:
+                found = stringdtype_endswith_na_data(
+                    value_data, value_index, value_allocator,
+                    value_na_kind, value_na[0], value_na[1],
+                    pattern_data, pattern_index, pattern_allocator,
+                    pattern_na_kind, pattern_na[0], pattern_na[1],
+                    pattern_empty_null, start, end) \
+                    if suffix else stringdtype_startswith_na_data(
+                        value_data, value_index, value_allocator,
+                        value_na_kind, value_na[0], value_na[1],
+                        pattern_data, pattern_index, pattern_allocator,
+                        pattern_na_kind, pattern_na[0], pattern_na[1],
+                        pattern_empty_null, start, end)
+                if found == STRINGDTYPE_BOOL_ERROR:
+                    bad_null = True
+                    break
+                result[result_i] = found == STRINGDTYPE_BOOL_TRUE
+            elif suffix:
+                result[result_i] = stringdtype_endswith_data(
+                    value_data, value_index, value_allocator,
+                    pattern_data, pattern_index, pattern_allocator,
+                    start, end)
+            else:
+                result[result_i] = stringdtype_startswith_data(
+                    value_data, value_index, value_allocator,
+                    pattern_data, pattern_index, pattern_allocator,
+                    start, end)
+            result_i += 1
+            value_index += inner_value_step
+            pattern_index += inner_pattern_step
+        if bad_null:
+            break
+
+        row_value_index, row_pattern_index = next_binary_row(
+            coords, out_shape, value_steps, pattern_steps, out_ndim,
+            row_value_index, row_pattern_index)
+
+    stringdtype_release_allocators(allocators)
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_search_nd(value, pattern, use_na, value_na_kind,
+                           pattern_na_kind, pattern_empty_null, start, end,
+                           search_op, raise_not_found):
+    out_shape_tuple, out_shape, value_steps, pattern_steps, out_ndim, total = \
+        binary_row_plan(value, pattern, _PACKED_STRING_SIZE)
+    result = np.empty(total, np.int64)
+    if total == 0:
+        return result.reshape(out_shape_tuple)
+
+    allocators = stringdtype_acquire_allocators(value, pattern)
+    value_allocator = allocators[0]
+    pattern_allocator = allocators[1]
+    value_data = stringdtype_data_ptr(value)
+    pattern_data = stringdtype_data_ptr(pattern)
+    bad_null = False
+    not_found = False
+    if use_na:
+        value_na = stringdtype_na_name(value)
+        pattern_na = stringdtype_na_name(pattern)
+
+    inner = out_shape[out_ndim - 1]
+    inner_value_step = value_steps[out_ndim - 1]
+    inner_pattern_step = pattern_steps[out_ndim - 1]
+    coords = np.zeros(out_ndim, np.intp)
+    result_i = 0
+    row_value_index = 0
+    row_pattern_index = 0
+    while result_i < total:
+        value_index = row_value_index
+        pattern_index = row_pattern_index
+        for _ in range(inner):
+            if use_na:
+                if search_op == 0:
+                    found = stringdtype_find_na_data(
+                        value_data, value_index, value_allocator,
+                        value_na_kind, value_na[0], value_na[1],
+                        pattern_data, pattern_index, pattern_allocator,
+                        pattern_na_kind, pattern_na[0], pattern_na[1],
+                        pattern_empty_null, start, end)
+                elif search_op == 1:
+                    found = stringdtype_rfind_na_data(
+                        value_data, value_index, value_allocator,
+                        value_na_kind, value_na[0], value_na[1],
+                        pattern_data, pattern_index, pattern_allocator,
+                        pattern_na_kind, pattern_na[0], pattern_na[1],
+                        pattern_empty_null, start, end)
+                else:
+                    found = stringdtype_count_na_data(
+                        value_data, value_index, value_allocator,
+                        value_na_kind, value_na[0], value_na[1],
+                        pattern_data, pattern_index, pattern_allocator,
+                        pattern_na_kind, pattern_na[0], pattern_na[1],
+                        pattern_empty_null, start, end)
+            elif search_op == 0:
+                found = stringdtype_find_data(
+                    value_data, value_index, value_allocator,
+                    pattern_data, pattern_index, pattern_allocator,
+                    start, end)
+            elif search_op == 1:
+                found = stringdtype_rfind_data(
+                    value_data, value_index, value_allocator,
+                    pattern_data, pattern_index, pattern_allocator,
+                    start, end)
+            else:
+                found = stringdtype_count_data(
+                    value_data, value_index, value_allocator,
+                    pattern_data, pattern_index, pattern_allocator,
+                    start, end)
+            if found == STRINGDTYPE_SEARCH_ERROR:
+                bad_null = True
+                break
+            if raise_not_found and found < 0:
+                not_found = True
+                break
+            result[result_i] = found
+            result_i += 1
+            value_index += inner_value_step
+            pattern_index += inner_pattern_step
+        if bad_null or not_found:
+            break
+
+        row_value_index, row_pattern_index = next_binary_row(
+            coords, out_shape, value_steps, pattern_steps, out_ndim,
+            row_value_index, row_pattern_index)
+
+    stringdtype_release_allocators(allocators)
+    if bad_null:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    if not_found:
+        raise ValueError('substring not found')
+    return result.reshape(out_shape_tuple)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_bool_result(value):
+    if value == STRINGDTYPE_BOOL_ERROR:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    return value == STRINGDTYPE_BOOL_TRUE
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_search_result(value, raise_not_found):
+    if value == STRINGDTYPE_SEARCH_ERROR:
+        raise ValueError(
+            'StringDType operation is not supported for this null value')
+    if raise_not_found and value < 0:
+        raise ValueError('substring not found')
+    return value
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_affix(data, index, allocator, pattern,
+                               pattern_length, pattern_size, start, end,
+                               suffix):
+    if suffix:
+        return stringdtype_endswith_unicode_data(
+            data, index, allocator, pattern, pattern_length, pattern_size,
+            start, end)
+    return stringdtype_startswith_unicode_data(
+        data, index, allocator, pattern, pattern_length, pattern_size, start,
+        end)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_utf8_affix(data, index, allocator, pattern_data,
+                            pattern_size, start, end, suffix):
+    if suffix:
+        return stringdtype_endswith_utf8_data(
+            data, index, allocator, pattern_data, pattern_size, start, end)
+    return stringdtype_startswith_utf8_data(
+        data, index, allocator, pattern_data, pattern_size, start, end)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _utf8_stringdtype_affix(value_data, start_byte, end_byte, start_index,
+                            pattern_data, pattern_index, allocator, suffix):
+    if suffix:
+        return utf8_endswith_stringdtype_sliced_data(
+            value_data, start_byte, end_byte, start_index, pattern_data,
+            pattern_index, allocator)
+    return utf8_startswith_stringdtype_sliced_data(
+        value_data, start_byte, end_byte, start_index, pattern_data,
+        pattern_index, allocator)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_unicode_search(data, index, allocator, pattern,
+                                pattern_length, pattern_size, start, end,
+                                search_op):
+    if search_op == 0:
+        return stringdtype_find_unicode_data(
+            data, index, allocator, pattern, pattern_length, pattern_size,
+            start, end)
+    if search_op == 1:
+        return stringdtype_rfind_unicode_data(
+            data, index, allocator, pattern, pattern_length, pattern_size,
+            start, end)
+    return stringdtype_count_unicode_data(
+        data, index, allocator, pattern, pattern_length, pattern_size, start,
+        end)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _stringdtype_utf8_search(data, index, allocator, pattern_data,
+                             pattern_size, start, end, search_op):
+    if search_op == 0:
+        return stringdtype_find_utf8_data(
+            data, index, allocator, pattern_data, pattern_size, start, end)
+    if search_op == 1:
+        return stringdtype_rfind_utf8_data(
+            data, index, allocator, pattern_data, pattern_size, start, end)
+    return stringdtype_count_utf8_data(
+        data, index, allocator, pattern_data, pattern_size, start, end)
+
+
+@register_jitable(**JIT_OPTIONS)
+def _utf8_stringdtype_search(value_data, start_byte, end_byte, start_index,
+                             end_index, start_offset, pattern_data,
+                             pattern_index, allocator, search_op):
+    if search_op == 0:
+        return utf8_find_stringdtype_sliced_data(
+            value_data, start_byte, end_byte, start_index, end_index,
+            start_offset, pattern_data, pattern_index, allocator)
+    if search_op == 1:
+        return utf8_rfind_stringdtype_sliced_data(
+            value_data, start_byte, end_byte, start_index, end_index,
+            start_offset, pattern_data, pattern_index, allocator)
+    return utf8_count_stringdtype_sliced_data(
+        value_data, start_byte, end_byte, start_index, end_index,
+        start_offset, pattern_data, pattern_index, allocator)
+
+
+def _overload_equal(left, right, invert):
+    left_stringdtype = is_stringdtype_array_type(left)
+    right_stringdtype = is_stringdtype_array_type(right)
+    if left_stringdtype or right_stringdtype:
+        use_na = _has_stringdtype_na(left, right)
+        if use_na and left_stringdtype and right_stringdtype:
+            if not _compatible_stringdtype_na(left, right):
+                def impl(left, right):
+                    raise TypeError(
+                        'Cannot find a compatible null string value')
+
+                return impl
+
+        if left_stringdtype and _is_unicode_scalar_like(right):
+            left_na_kind = _stringdtype_na_kind(left)
+            op_code = 1 if invert else 0
+            if left.ndim > 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_nd(
+                        left, right, literally(use_na),
+                        literally(left_na_kind), literally(False),
+                        literally(op_code))
+
+                return impl
+
+            _validate_stringdtype_array(left)
+            if left.ndim == 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_scalar(
+                        left, right, literally(use_na),
+                        literally(left_na_kind), literally(False),
+                        literally(op_code))
+
+                return impl
+
+        if _is_unicode_scalar_like(left) and right_stringdtype:
+            right_na_kind = _stringdtype_na_kind(right)
+            op_code = 1 if invert else 0
+            if right.ndim > 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_nd(
+                        right, left, literally(use_na),
+                        literally(right_na_kind), literally(True),
+                        literally(op_code))
+
+                return impl
+
+            _validate_stringdtype_array(right)
+            if right.ndim == 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_scalar(
+                        right, left, literally(use_na),
+                        literally(right_na_kind), literally(True),
+                        literally(op_code))
+
+                return impl
+
+        if left_stringdtype and _is_unicode_array(right) and right.ndim == 1:
+            _validate_stringdtype_array(left)
+            _validate_unicode_array(right)
+            left_na_kind = _stringdtype_na_kind(left)
+
+            def impl(left, right):
+                size, left_single, right_single = \
+                    _stringdtype_1d_broadcast_size(
+                        left.ndim, left.size, right.ndim, right.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(left)
+                data = stringdtype_data_ptr(left)
+                step = 1 if left.ndim == 0 else _stringdtype_step(left)
+                if use_na:
+                    left_na = stringdtype_na_name(left)
+                if use_na:
+                    for i in range(size):
+                        left_index = 0 if left_single else i * step
+                        right_i = 0 if right_single else i
+                        right_value = _unicode_scalar_value(right[right_i])
+                        if not stringdtype_unicode_valid(right_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        right_parts = stringdtype_unicode_parts(right_value)
+                        if invert:
+                            result[i] = stringdtype_not_equal_unicode_na_data(
+                                data, left_index, allocator,
+                                left_na_kind, left_na[0], left_na[1],
+                                right_value, right_parts[0], right_parts[1],
+                                False)
+                        else:
+                            result[i] = stringdtype_equal_unicode_na_data(
+                                data, left_index, allocator,
+                                left_na_kind, left_na[0], left_na[1],
+                                right_value, right_parts[0], right_parts[1],
+                                False)
+                elif invert:
+                    for i in range(size):
+                        left_index = 0 if left_single else i * step
+                        right_i = 0 if right_single else i
+                        right_value = _unicode_scalar_value(right[right_i])
+                        if not stringdtype_unicode_valid(right_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        right_parts = stringdtype_unicode_parts(right_value)
+                        result[i] = not stringdtype_equal_unicode_data(
+                            data, left_index, allocator, right_value,
+                            right_parts[0], right_parts[1])
+                else:
+                    for i in range(size):
+                        left_index = 0 if left_single else i * step
+                        right_i = 0 if right_single else i
+                        right_value = _unicode_scalar_value(right[right_i])
+                        if not stringdtype_unicode_valid(right_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        right_parts = stringdtype_unicode_parts(right_value)
+                        result[i] = stringdtype_equal_unicode_data(
+                            data, left_index, allocator, right_value,
+                            right_parts[0], right_parts[1])
+                stringdtype_release_allocator(allocator)
+                return result
+
+            return impl
+
+        if _is_unicode_array(left) and left.ndim == 1 and right_stringdtype:
+            _validate_unicode_array(left)
+            _validate_stringdtype_array(right)
+            right_na_kind = _stringdtype_na_kind(right)
+
+            def impl(left, right):
+                size, left_single, right_single = \
+                    _stringdtype_1d_broadcast_size(
+                        left.ndim, left.size, right.ndim, right.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(right)
+                data = stringdtype_data_ptr(right)
+                step = 1 if right.ndim == 0 else _stringdtype_step(right)
+                if use_na:
+                    right_na = stringdtype_na_name(right)
+                if use_na:
+                    for i in range(size):
+                        right_index = 0 if right_single else i * step
+                        left_i = 0 if left_single else i
+                        left_value = _unicode_scalar_value(left[left_i])
+                        if not stringdtype_unicode_valid(left_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        left_parts = stringdtype_unicode_parts(left_value)
+                        if invert:
+                            result[i] = stringdtype_not_equal_unicode_na_data(
+                                data, right_index, allocator,
+                                right_na_kind, right_na[0], right_na[1],
+                                left_value, left_parts[0], left_parts[1],
+                                True)
+                        else:
+                            result[i] = stringdtype_equal_unicode_na_data(
+                                data, right_index, allocator,
+                                right_na_kind, right_na[0], right_na[1],
+                                left_value, left_parts[0], left_parts[1],
+                                True)
+                elif invert:
+                    for i in range(size):
+                        right_index = 0 if right_single else i * step
+                        left_i = 0 if left_single else i
+                        left_value = _unicode_scalar_value(left[left_i])
+                        if not stringdtype_unicode_valid(left_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        left_parts = stringdtype_unicode_parts(left_value)
+                        result[i] = not stringdtype_equal_unicode_data(
+                            data, right_index, allocator, left_value,
+                            left_parts[0], left_parts[1])
+                else:
+                    for i in range(size):
+                        right_index = 0 if right_single else i * step
+                        left_i = 0 if left_single else i
+                        left_value = _unicode_scalar_value(left[left_i])
+                        if not stringdtype_unicode_valid(left_value):
+                            stringdtype_release_allocator(allocator)
+                            raise TypeError('Invalid unicode code point found')
+                        left_parts = stringdtype_unicode_parts(left_value)
+                        result[i] = stringdtype_equal_unicode_data(
+                            data, right_index, allocator, left_value,
+                            left_parts[0], left_parts[1])
+                stringdtype_release_allocator(allocator)
+                return result
+
+            return impl
+
+        if left_stringdtype and _is_none(right):
+            _validate_stringdtype_array(left)
+            if left.ndim == 0:
+                def impl(left, right):
+                    return True if invert else False
+
+                return impl
+
+            def impl(left, right):
+                result = np.empty(left.size, np.bool_)
+                for i in range(left.size):
+                    result[i] = True if invert else False
+                return result
+
+            return impl
+
+        if _is_none(left) and right_stringdtype:
+            _validate_stringdtype_array(right)
+            if right.ndim == 0:
+                def impl(left, right):
+                    return True if invert else False
+
+                return impl
+
+            def impl(left, right):
+                result = np.empty(right.size, np.bool_)
+                for i in range(right.size):
+                    result[i] = True if invert else False
+                return result
+
+            return impl
+
+        if not left_stringdtype or not right_stringdtype:
+            raise NumbaValueError('StringDType comparisons currently require '
+                                  'two StringDType arrays')
+        left_na_kind = _stringdtype_na_kind(left)
+        right_na_kind = _stringdtype_na_kind(right)
+        op_code = 1 if invert else 0
+
+        if left.ndim == 0 and right.ndim == 0:
+            def impl(left, right):
+                return _stringdtype_pair_bool_scalar(
+                    left, right, literally(use_na), literally(left_na_kind),
+                    literally(right_na_kind), literally(op_code))
+
+            return impl
+
+        def impl(left, right):
+            return _stringdtype_binary_bool_nd(
+                left, right, literally(use_na), literally(left_na_kind),
+                literally(right_na_kind), literally(op_code))
+
+        return impl
+
+    left_bytes_array = _is_bytes_array(left)
+    right_bytes_array = _is_bytes_array(right)
+    if left_bytes_array and right_bytes_array \
+            and left.ndim == right.ndim == 1:
+        def impl(left, right):
+            return _bytes_equal_array_array(left, right, invert)
+        return impl
+    if left_bytes_array and left.ndim == 1 and _is_bytes_scalar(right):
+        def impl(left, right):
+            return _bytes_equal_array_scalar(left, right, invert)
+        return impl
+    if right_bytes_array and right.ndim == 1 and _is_bytes_scalar(left):
+        def impl(left, right):
+            return _bytes_equal_array_scalar(right, left, invert)
+        return impl
+
+    fixed = _fixed_width_equal_nd_impl(left, right, invert, False)
+    if fixed is not None:
+        return fixed
+
+    registered = try_register_pair(left, right)
+    if registered is None:
+        if _has_string_operand(left, right):
+            return None
+        return _numpy_fallback('not_equal' if invert else 'equal')
+
+    register_left, register_right, left_dim, right_dim = registered
+    return equal_dispatch(register_left, register_right, left_dim, right_dim,
+                          equal_kernel(left, right, equal, equal_sub32_bytes,
+                                       equal_sub32_unicode),
+                          False, invert)
+
+
+def _overload_order(left, right, op):
+    left_stringdtype = is_stringdtype_array_type(left)
+    right_stringdtype = is_stringdtype_array_type(right)
+    if left_stringdtype or right_stringdtype:
+        use_na = _has_stringdtype_na(left, right)
+        if use_na and left_stringdtype and right_stringdtype:
+            if not _compatible_stringdtype_na(left, right):
+                def impl(left, right):
+                    raise TypeError(
+                        'Cannot find a compatible null string value')
+
+                return impl
+
+        if op == 'greater':
+            op_code = 0
+        elif op == 'greater_equal':
+            op_code = 1
+        elif op == 'less':
+            op_code = 2
+        else:
+            op_code = 3
+        bool_op = op_code + 2
+
+        if left_stringdtype and _is_unicode_scalar_like(right):
+            left_na_kind = _stringdtype_na_kind(left)
+            if left.ndim > 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_nd(
+                        left, right, literally(use_na),
+                        literally(left_na_kind), literally(False),
+                        literally(bool_op))
+
+                return impl
+
+            _validate_stringdtype_array(left)
+            if left.ndim == 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_scalar(
+                        left, right, literally(use_na),
+                        literally(left_na_kind), literally(False),
+                        literally(bool_op))
+
+                return impl
+
+        if _is_unicode_scalar_like(left) and right_stringdtype:
+            right_na_kind = _stringdtype_na_kind(right)
+            if right.ndim > 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_nd(
+                        right, left, literally(use_na),
+                        literally(right_na_kind), literally(True),
+                        literally(bool_op))
+
+                return impl
+
+            _validate_stringdtype_array(right)
+            if right.ndim == 0:
+                def impl(left, right):
+                    return _stringdtype_unicode_bool_scalar(
+                        right, left, literally(use_na),
+                        literally(right_na_kind), literally(True),
+                        literally(bool_op))
+
+                return impl
+
+        if left_stringdtype and _is_unicode_array(right) and right.ndim == 1:
+            _validate_stringdtype_array(left)
+            _validate_unicode_array(right)
+            left_na_kind = _stringdtype_na_kind(left)
+
+            def impl(left, right):
+                size, left_single, right_single = \
+                    _stringdtype_1d_broadcast_size(
+                        left.ndim, left.size, right.ndim, right.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(left)
+                data = stringdtype_data_ptr(left)
+                step = 1 if left.ndim == 0 else _stringdtype_step(left)
+                bad_order = False
+                if use_na:
+                    left_na = stringdtype_na_name(left)
+                for i in range(size):
+                    left_index = 0 if left_single else i * step
+                    right_i = 0 if right_single else i
+                    right_value = _unicode_scalar_value(right[right_i])
+                    if not stringdtype_unicode_valid(right_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    right_parts = stringdtype_unicode_parts(right_value)
+                    if use_na:
+                        cmp_result = stringdtype_compare_unicode_na_data(
+                            data, left_index, allocator,
+                            left_na_kind, left_na[0], left_na[1],
+                            right_value, right_parts[0], right_parts[1],
+                            False)
+                        if cmp_result == STRINGDTYPE_ORDER_ERROR:
+                            bad_order = True
+                            break
+                        if cmp_result == STRINGDTYPE_ORDER_FALSE:
+                            result[i] = False
+                        else:
+                            result[i] = _order_result(cmp_result, op_code)
+                    else:
+                        cmp_result = stringdtype_compare_unicode_data(
+                            data, left_index, allocator,
+                            right_value, right_parts[0], right_parts[1])
+                        result[i] = _order_result(cmp_result, op_code)
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_order:
+                    raise ValueError(
+                        'StringDType ordering is not supported for this null '
+                        'value')
+                return result
+
+            return impl
+
+        if _is_unicode_array(left) and left.ndim == 1 and right_stringdtype:
+            _validate_unicode_array(left)
+            _validate_stringdtype_array(right)
+            right_na_kind = _stringdtype_na_kind(right)
+
+            def impl(left, right):
+                size, left_single, right_single = \
+                    _stringdtype_1d_broadcast_size(
+                        left.ndim, left.size, right.ndim, right.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(right)
+                data = stringdtype_data_ptr(right)
+                step = 1 if right.ndim == 0 else _stringdtype_step(right)
+                bad_order = False
+                if use_na:
+                    right_na = stringdtype_na_name(right)
+                for i in range(size):
+                    right_index = 0 if right_single else i * step
+                    left_i = 0 if left_single else i
+                    left_value = _unicode_scalar_value(left[left_i])
+                    if not stringdtype_unicode_valid(left_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    left_parts = stringdtype_unicode_parts(left_value)
+                    if use_na:
+                        cmp_result = stringdtype_compare_unicode_na_data(
+                            data, right_index, allocator,
+                            right_na_kind, right_na[0], right_na[1],
+                            left_value, left_parts[0], left_parts[1], True)
+                        if cmp_result == STRINGDTYPE_ORDER_ERROR:
+                            bad_order = True
+                            break
+                        if cmp_result == STRINGDTYPE_ORDER_FALSE:
+                            result[i] = False
+                        else:
+                            result[i] = _order_result(-cmp_result, op_code)
+                    else:
+                        cmp_result = -stringdtype_compare_unicode_data(
+                            data, right_index, allocator,
+                            left_value, left_parts[0], left_parts[1])
+                        result[i] = _order_result(cmp_result, op_code)
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_order:
+                    raise ValueError(
+                        'StringDType ordering is not supported for this null '
+                        'value')
+                return result
+
+            return impl
+
+        if not left_stringdtype or not right_stringdtype:
+            raise NumbaValueError('StringDType comparisons currently require '
+                                  'two StringDType arrays')
+        left_na_kind = _stringdtype_na_kind(left)
+        right_na_kind = _stringdtype_na_kind(right)
+
+        if left.ndim == 0 and right.ndim == 0:
+            def impl(left, right):
+                return _stringdtype_pair_bool_scalar(
+                    left, right, literally(use_na), literally(left_na_kind),
+                    literally(right_na_kind), literally(bool_op))
+
+            return impl
+
+        def impl(left, right):
+            return _stringdtype_binary_bool_nd(
+                left, right, literally(use_na), literally(left_na_kind),
+                literally(right_na_kind), literally(bool_op))
+
+        return impl
+
+    fixed = _fixed_width_order_nd_impl(left, right, op, False)
+    if fixed is not None:
+        return fixed
+
+    registered = try_register_pair(left, right)
+    if registered is None:
+        if _has_string_operand(left, right):
+            return None
+        return _numpy_fallback(op)
+
+    register_left, register_right, left_dim, right_dim = registered
+    return order_dispatch(register_left, register_right, left_dim, right_dim,
+                          greater, greater_equal, op, False)
+
+
+def _overload_affix(value, pattern, start, end, suffix):
+    value_stringdtype = is_stringdtype_array_type(value)
+    pattern_stringdtype = is_stringdtype_array_type(pattern)
+    if value_stringdtype or pattern_stringdtype:
+        use_na = _has_stringdtype_na(value, pattern)
+        if use_na and value_stringdtype and pattern_stringdtype:
+            if not _compatible_stringdtype_na(value, pattern):
+                def impl(value, pattern, start=0, end=None):
+                    raise TypeError(
+                        'Cannot find a compatible null string value')
+
+                return impl
+
+        s, e = ensure_slice(start, end)
+
+        if value_stringdtype and _is_unicode_scalar_like(pattern):
+            value_na_kind = _stringdtype_na_kind(value)
+            if value.ndim > 0:
+                def impl(value, pattern, start=0, end=None):
+                    start = start or s
+                    end = e if end is None else end
+                    return _stringdtype_unicode_affix_nd(
+                        value, pattern, literally(use_na),
+                        literally(value_na_kind), start, end,
+                        literally(suffix))
+
+                return impl
+
+            _validate_stringdtype_array(value)
+            if value.ndim == 0:
+                def impl(value, pattern, start=0, end=None):
+                    pattern_value = _unicode_scalar_value(pattern)
+                    if not stringdtype_unicode_valid(pattern_value):
+                        raise TypeError('Invalid unicode code point found')
+                    pattern_parts = stringdtype_unicode_parts(pattern_value)
+                    start = start or s
+                    end = e if end is None else end
+                    allocator = stringdtype_acquire_allocator(value)
+                    data = stringdtype_data_ptr(value)
+                    if use_na:
+                        value_na = stringdtype_na_name(value)
+                        result = stringdtype_endswith_unicode_na_data(
+                            data, 0, allocator, value_na_kind, value_na[0],
+                            value_na[1], pattern_value, pattern_parts[0],
+                            pattern_parts[1], start, end) if suffix \
+                            else stringdtype_startswith_unicode_na_data(
+                                data, 0, allocator, value_na_kind, value_na[0],
+                                value_na[1], pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                    elif pattern_parts[1] > _PACKED_STRING_SIZE:
+                        pattern_span = stringdtype_unicode_utf8_span(
+                            pattern_value, pattern_parts[0],
+                            pattern_parts[1])
+                        result = _stringdtype_utf8_affix(
+                            data, 0, allocator, pattern_span[0],
+                            pattern_span[1], start, end, suffix)
+                        stringdtype_free_utf8_span(pattern_span[0],
+                                                   pattern_span[2])
+                    else:
+                        result = _stringdtype_unicode_affix(
+                            data, 0, allocator, pattern_value,
+                            pattern_parts[0], pattern_parts[1], start, end,
+                            suffix)
+                    stringdtype_release_allocator(allocator)
+                    if use_na:
+                        return _stringdtype_bool_result(result)
+                    return result
+
+                return impl
+
+        if _NUMPY_LT_2_1 and pattern_stringdtype \
+                and (_is_unicode_scalar_like(value)
+                     or _is_unicode_array(value)):
+            return _unsupported_stringdtype_loop(
+                'endswith' if suffix else 'startswith')
+
+        if _is_unicode_scalar_like(value) and pattern_stringdtype:
+            pattern_na_kind = _stringdtype_na_kind(pattern)
+            if pattern.ndim > 0:
+                def impl(value, pattern, start=0, end=None):
+                    start = start or s
+                    end = e if end is None else end
+                    return _unicode_stringdtype_affix_nd(
+                        value, pattern, literally(use_na),
+                        literally(pattern_na_kind), start, end,
+                        literally(suffix))
+
+                return impl
+
+            _validate_stringdtype_array(pattern)
+            if pattern.ndim == 0:
+                def impl(value, pattern, start=0, end=None):
+                    value_value = _unicode_scalar_value(value)
+                    if not stringdtype_unicode_valid(value_value):
+                        raise TypeError('Invalid unicode code point found')
+                    value_parts = stringdtype_unicode_parts(value_value)
+                    start = start or s
+                    end = e if end is None else end
+                    value_span = stringdtype_unicode_utf8_span(
+                        value_value, value_parts[0], value_parts[1])
+                    slice_parts = stringdtype_utf8_slice(
+                        value_span[0], value_span[1], start, end)
+                    allocator = stringdtype_acquire_allocator(pattern)
+                    data = stringdtype_data_ptr(pattern)
+                    if use_na:
+                        pattern_na = stringdtype_na_name(pattern)
+                        result = utf8_endswith_stringdtype_sliced_na_data(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], data, 0, allocator,
+                            pattern_na_kind, pattern_na[0], pattern_na[1],
+                            True) if suffix \
+                            else utf8_startswith_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], data, 0, allocator,
+                                pattern_na_kind, pattern_na[0],
+                                pattern_na[1], True)
+                    else:
+                        result = _utf8_stringdtype_affix(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], data, 0, allocator, suffix)
+                    stringdtype_release_allocator(allocator)
+                    stringdtype_free_utf8_span(value_span[0], value_span[2])
+                    if use_na:
+                        return _stringdtype_bool_result(result)
+                    return result
+
+                return impl
+
+        if value_stringdtype and _is_unicode_array(pattern) \
+                and pattern.ndim == 1:
+            _validate_stringdtype_array(value)
+            _validate_unicode_array(pattern)
+            value_na_kind = _stringdtype_na_kind(value)
+
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                size, value_single, pattern_single = \
+                    _stringdtype_1d_broadcast_size(
+                        value.ndim, value.size, pattern.ndim, pattern.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(value)
+                data = stringdtype_data_ptr(value)
+                step = 1 if value.ndim == 0 else _stringdtype_step(value)
+                bad_null = False
+                if use_na:
+                    value_na = stringdtype_na_name(value)
+                for i in range(size):
+                    value_index = 0 if value_single else i * step
+                    pattern_i = 0 if pattern_single else i
+                    pattern_value = _unicode_scalar_value(pattern[pattern_i])
+                    if not stringdtype_unicode_valid(pattern_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    pattern_parts = stringdtype_unicode_parts(pattern_value)
+                    if use_na:
+                        found = stringdtype_endswith_unicode_na_data(
+                            data, value_index, allocator,
+                            value_na_kind, value_na[0], value_na[1],
+                            pattern_value, pattern_parts[0], pattern_parts[1],
+                            start, end) if suffix \
+                            else stringdtype_startswith_unicode_na_data(
+                                data, value_index, allocator,
+                                value_na_kind, value_na[0], value_na[1],
+                                pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                        if found == STRINGDTYPE_BOOL_ERROR:
+                            bad_null = True
+                            break
+                        result[i] = found == STRINGDTYPE_BOOL_TRUE
+                    else:
+                        result[i] = _stringdtype_unicode_affix(
+                            data, value_index, allocator,
+                            pattern_value, pattern_parts[0], pattern_parts[1],
+                            start, end, suffix)
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_null:
+                    raise ValueError(
+                        'StringDType operation is not supported for this null '
+                        'value')
+                return result
+
+            return impl
+
+        if _is_unicode_array(value) and value.ndim == 1 \
+                and pattern_stringdtype:
+            _validate_unicode_array(value)
+            _validate_stringdtype_array(pattern)
+            pattern_na_kind = _stringdtype_na_kind(pattern)
+
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                size, value_single, pattern_single = \
+                    _stringdtype_1d_broadcast_size(
+                        value.ndim, value.size, pattern.ndim, pattern.size)
+                result = np.empty(size, np.bool_)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(pattern)
+                data = stringdtype_data_ptr(pattern)
+                step = 1 if pattern.ndim == 0 else _stringdtype_step(pattern)
+                bad_null = False
+                if use_na:
+                    pattern_na = stringdtype_na_name(pattern)
+                for i in range(size):
+                    pattern_index = 0 if pattern_single else i * step
+                    value_i = 0 if value_single else i
+                    value_value = _unicode_scalar_value(value[value_i])
+                    if not stringdtype_unicode_valid(value_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    value_parts = stringdtype_unicode_parts(value_value)
+                    value_span = stringdtype_unicode_utf8_span(
+                        value_value, value_parts[0], value_parts[1])
+                    slice_parts = stringdtype_utf8_slice(
+                        value_span[0], value_span[1], start, end)
+                    if use_na:
+                        found = utf8_endswith_stringdtype_sliced_na_data(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], data, pattern_index,
+                            allocator, pattern_na_kind, pattern_na[0],
+                            pattern_na[1], True) if suffix \
+                            else utf8_startswith_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], data, pattern_index, allocator,
+                                pattern_na_kind, pattern_na[0], pattern_na[1],
+                                True)
+                        if found == STRINGDTYPE_BOOL_ERROR:
+                            bad_null = True
+                            stringdtype_free_utf8_span(value_span[0],
+                                                       value_span[2])
+                            break
+                        result[i] = found == STRINGDTYPE_BOOL_TRUE
+                    else:
+                        result[i] = _utf8_stringdtype_affix(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], data, pattern_index,
+                            allocator, suffix)
+                    stringdtype_free_utf8_span(value_span[0], value_span[2])
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_null:
+                    raise ValueError(
+                        'StringDType operation is not supported for this null '
+                        'value')
+                return result
+
+            return impl
+
+        if not value_stringdtype or not pattern_stringdtype:
+            raise NumbaValueError('StringDType prefix/suffix operations '
+                                  'currently require two StringDType arrays')
+        value_na_kind = _stringdtype_na_kind(value)
+        pattern_na_kind = _stringdtype_na_kind(pattern)
+        pattern_empty_null = value_na_kind == 0
+
+        if value.ndim == 0 and pattern.ndim == 0:
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                allocators = stringdtype_acquire_allocators(value, pattern)
+                if use_na:
+                    value_na = stringdtype_na_name(value)
+                    pattern_na = stringdtype_na_name(pattern)
+                    result = stringdtype_endswith_na_data(
+                        stringdtype_data_ptr(value), 0, allocators[0],
+                        value_na_kind, value_na[0], value_na[1],
+                        stringdtype_data_ptr(pattern), 0, allocators[1],
+                        pattern_na_kind, pattern_na[0], pattern_na[1],
+                        pattern_empty_null, start, end) if suffix \
+                        else stringdtype_startswith_na_data(
+                            stringdtype_data_ptr(value), 0, allocators[0],
+                            value_na_kind, value_na[0], value_na[1],
+                            stringdtype_data_ptr(pattern), 0, allocators[1],
+                            pattern_na_kind, pattern_na[0], pattern_na[1],
+                            pattern_empty_null, start, end)
+                elif suffix:
+                    result = stringdtype_endswith_data(
+                        stringdtype_data_ptr(value), 0, allocators[0],
+                        stringdtype_data_ptr(pattern), 0, allocators[1],
+                        start, end,
+                    )
+                else:
+                    result = stringdtype_startswith_data(
+                        stringdtype_data_ptr(value), 0, allocators[0],
+                        stringdtype_data_ptr(pattern), 0, allocators[1],
+                        start, end,
+                    )
+                stringdtype_release_allocators(allocators)
+                if use_na:
+                    return _stringdtype_bool_result(result)
+                return result
+
+            return impl
+
+        def impl(value, pattern, start=0, end=None):
+            start = start or s
+            end = e if end is None else end
+            return _stringdtype_affix_nd(
+                value, pattern, literally(use_na), literally(value_na_kind),
+                literally(pattern_na_kind), literally(pattern_empty_null),
+                start, end, literally(suffix))
+
+        return impl
+
+    if suffix:
+        return ov_char_endswith(value, pattern, start, end)
+    return ov_char_startswith(value, pattern, start, end)
+
+
+def _overload_search(value, pattern, start, end, op):
+    value_stringdtype = is_stringdtype_array_type(value)
+    pattern_stringdtype = is_stringdtype_array_type(pattern)
+    if value_stringdtype or pattern_stringdtype:
+        use_na = _has_stringdtype_na(value, pattern)
+        if use_na and value_stringdtype and pattern_stringdtype:
+            if not _compatible_stringdtype_na(value, pattern):
+                def impl(value, pattern, start=0, end=None):
+                    raise TypeError(
+                        'Cannot find a compatible null string value')
+
+                return impl
+
+        s, e = ensure_slice(start, end)
+        forward = op == 'find' or op == 'index'
+        reverse = op == 'rfind' or op == 'rindex'
+        raise_not_found = op == 'index' or op == 'rindex'
+        search_op = 0 if forward else 1 if reverse else 2
+
+        if value_stringdtype and _is_unicode_scalar_like(pattern):
+            value_na_kind = _stringdtype_na_kind(value)
+            if value.ndim > 0:
+                def impl(value, pattern, start=0, end=None):
+                    start = start or s
+                    end = e if end is None else end
+                    return _stringdtype_unicode_search_nd(
+                        value, pattern, literally(use_na),
+                        literally(value_na_kind), start, end,
+                        literally(search_op), literally(raise_not_found))
+
+                return impl
+
+            _validate_stringdtype_array(value)
+            if value.ndim == 0:
+                def impl(value, pattern, start=0, end=None):
+                    pattern_value = _unicode_scalar_value(pattern)
+                    if not stringdtype_unicode_valid(pattern_value):
+                        raise TypeError('Invalid unicode code point found')
+                    pattern_parts = stringdtype_unicode_parts(pattern_value)
+                    start = start or s
+                    end = e if end is None else end
+                    allocator = stringdtype_acquire_allocator(value)
+                    data = stringdtype_data_ptr(value)
+                    if use_na:
+                        value_na = stringdtype_na_name(value)
+                        if forward:
+                            found = stringdtype_find_unicode_na_data(
+                                data, 0, allocator, value_na_kind, value_na[0],
+                                value_na[1], pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                        elif reverse:
+                            found = stringdtype_rfind_unicode_na_data(
+                                data, 0, allocator, value_na_kind, value_na[0],
+                                value_na[1], pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                        else:
+                            found = stringdtype_count_unicode_na_data(
+                                data, 0, allocator, value_na_kind, value_na[0],
+                                value_na[1], pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                    elif pattern_parts[1] > _PACKED_STRING_SIZE:
+                        pattern_span = stringdtype_unicode_utf8_span(
+                            pattern_value, pattern_parts[0],
+                            pattern_parts[1])
+                        found = _stringdtype_utf8_search(
+                            data, 0, allocator, pattern_span[0],
+                            pattern_span[1], start, end, search_op)
+                        stringdtype_free_utf8_span(pattern_span[0],
+                                                   pattern_span[2])
+                    else:
+                        found = _stringdtype_unicode_search(
+                            data, 0, allocator, pattern_value,
+                            pattern_parts[0], pattern_parts[1], start, end,
+                            search_op)
+                    stringdtype_release_allocator(allocator)
+                    return _stringdtype_search_result(found, raise_not_found)
+
+                return impl
+
+        if _NUMPY_LT_2_1 and pattern_stringdtype \
+                and (_is_unicode_scalar_like(value)
+                     or _is_unicode_array(value)):
+            return _unsupported_stringdtype_loop(op)
+
+        if _is_unicode_scalar_like(value) and pattern_stringdtype:
+            pattern_na_kind = _stringdtype_na_kind(pattern)
+            if pattern.ndim > 0:
+                def impl(value, pattern, start=0, end=None):
+                    start = start or s
+                    end = e if end is None else end
+                    return _unicode_stringdtype_search_nd(
+                        value, pattern, literally(use_na),
+                        literally(pattern_na_kind), start, end,
+                        literally(search_op), literally(raise_not_found))
+
+                return impl
+
+            _validate_stringdtype_array(pattern)
+            if pattern.ndim == 0:
+                def impl(value, pattern, start=0, end=None):
+                    value_value = _unicode_scalar_value(value)
+                    if not stringdtype_unicode_valid(value_value):
+                        raise TypeError('Invalid unicode code point found')
+                    value_parts = stringdtype_unicode_parts(value_value)
+                    start = start or s
+                    end = e if end is None else end
+                    value_span = stringdtype_unicode_utf8_span(
+                        value_value, value_parts[0], value_parts[1])
+                    slice_parts = stringdtype_utf8_search_slice(
+                        value_span[0], value_span[1], start, end)
+                    allocator = stringdtype_acquire_allocator(pattern)
+                    data = stringdtype_data_ptr(pattern)
+                    if use_na:
+                        pattern_na = stringdtype_na_name(pattern)
+                        if forward:
+                            found = utf8_find_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, 0, allocator,
+                                pattern_na_kind, pattern_na[0],
+                                pattern_na[1], True)
+                        elif reverse:
+                            found = utf8_rfind_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, 0, allocator,
+                                pattern_na_kind, pattern_na[0],
+                                pattern_na[1], True)
+                        else:
+                            found = utf8_count_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, 0, allocator,
+                                pattern_na_kind, pattern_na[0],
+                                pattern_na[1], True)
+                    else:
+                        found = _utf8_stringdtype_search(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], slice_parts[3], slice_parts[4],
+                            data, 0, allocator, search_op)
+                    stringdtype_release_allocator(allocator)
+                    stringdtype_free_utf8_span(value_span[0], value_span[2])
+                    return _stringdtype_search_result(found, raise_not_found)
+
+                return impl
+
+        if value_stringdtype and _is_unicode_array(pattern) \
+                and pattern.ndim == 1:
+            _validate_stringdtype_array(value)
+            _validate_unicode_array(pattern)
+            value_na_kind = _stringdtype_na_kind(value)
+
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                size, value_single, pattern_single = \
+                    _stringdtype_1d_broadcast_size(
+                        value.ndim, value.size, pattern.ndim, pattern.size)
+                result = np.empty(size, np.int64)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(value)
+                data = stringdtype_data_ptr(value)
+                step = 1 if value.ndim == 0 else _stringdtype_step(value)
+                not_found = False
+                bad_null = False
+                if use_na:
+                    value_na = stringdtype_na_name(value)
+                for i in range(size):
+                    value_index = 0 if value_single else i * step
+                    pattern_i = 0 if pattern_single else i
+                    pattern_value = _unicode_scalar_value(pattern[pattern_i])
+                    if not stringdtype_unicode_valid(pattern_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    pattern_parts = stringdtype_unicode_parts(pattern_value)
+                    if use_na:
+                        if forward:
+                            found = stringdtype_find_unicode_na_data(
+                                data, value_index, allocator,
+                                value_na_kind, value_na[0], value_na[1],
+                                pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                        elif reverse:
+                            found = stringdtype_rfind_unicode_na_data(
+                                data, value_index, allocator,
+                                value_na_kind, value_na[0], value_na[1],
+                                pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                        else:
+                            found = stringdtype_count_unicode_na_data(
+                                data, value_index, allocator,
+                                value_na_kind, value_na[0], value_na[1],
+                                pattern_value, pattern_parts[0],
+                                pattern_parts[1], start, end)
+                    else:
+                        found = _stringdtype_unicode_search(
+                            data, value_index, allocator,
+                            pattern_value, pattern_parts[0], pattern_parts[1],
+                            start, end, search_op)
+                    if found == STRINGDTYPE_SEARCH_ERROR:
+                        bad_null = True
+                        break
+                    if raise_not_found and found < 0:
+                        not_found = True
+                        break
+                    result[i] = found
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_null:
+                    raise ValueError(
+                        'StringDType operation is not supported for this null '
+                        'value')
+                if not_found:
+                    raise ValueError('substring not found')
+                return result
+
+            return impl
+
+        if _is_unicode_array(value) and value.ndim == 1 \
+                and pattern_stringdtype:
+            _validate_unicode_array(value)
+            _validate_stringdtype_array(pattern)
+            pattern_na_kind = _stringdtype_na_kind(pattern)
+
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                size, value_single, pattern_single = \
+                    _stringdtype_1d_broadcast_size(
+                        value.ndim, value.size, pattern.ndim, pattern.size)
+                result = np.empty(size, np.int64)
+                if size == 0:
+                    return result
+                allocator = stringdtype_acquire_allocator(pattern)
+                data = stringdtype_data_ptr(pattern)
+                step = 1 if pattern.ndim == 0 else _stringdtype_step(pattern)
+                not_found = False
+                bad_null = False
+                if use_na:
+                    pattern_na = stringdtype_na_name(pattern)
+                for i in range(size):
+                    pattern_index = 0 if pattern_single else i * step
+                    value_i = 0 if value_single else i
+                    value_value = _unicode_scalar_value(value[value_i])
+                    if not stringdtype_unicode_valid(value_value):
+                        stringdtype_release_allocator(allocator)
+                        raise TypeError('Invalid unicode code point found')
+                    value_parts = stringdtype_unicode_parts(value_value)
+                    value_span = stringdtype_unicode_utf8_span(
+                        value_value, value_parts[0], value_parts[1])
+                    slice_parts = stringdtype_utf8_search_slice(
+                        value_span[0], value_span[1], start, end)
+                    if use_na:
+                        if forward:
+                            found = utf8_find_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, pattern_index, allocator,
+                                pattern_na_kind, pattern_na[0], pattern_na[1],
+                                True)
+                        elif reverse:
+                            found = utf8_rfind_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, pattern_index, allocator,
+                                pattern_na_kind, pattern_na[0], pattern_na[1],
+                                True)
+                        else:
+                            found = utf8_count_stringdtype_sliced_na_data(
+                                value_span[0], slice_parts[0], slice_parts[1],
+                                slice_parts[2], slice_parts[3],
+                                slice_parts[4], data, pattern_index, allocator,
+                                pattern_na_kind, pattern_na[0], pattern_na[1],
+                                True)
+                    else:
+                        found = _utf8_stringdtype_search(
+                            value_span[0], slice_parts[0], slice_parts[1],
+                            slice_parts[2], slice_parts[3], slice_parts[4],
+                            data, pattern_index, allocator, search_op)
+                    stringdtype_free_utf8_span(value_span[0], value_span[2])
+                    if found == STRINGDTYPE_SEARCH_ERROR:
+                        bad_null = True
+                        break
+                    if raise_not_found and found < 0:
+                        not_found = True
+                        break
+                    result[i] = found
+                stringdtype_release_allocator(allocator)
+                if use_na and bad_null:
+                    raise ValueError(
+                        'StringDType operation is not supported for this null '
+                        'value')
+                if not_found:
+                    raise ValueError('substring not found')
+                return result
+
+            return impl
+
+        if not value_stringdtype or not pattern_stringdtype:
+            raise NumbaValueError('StringDType search operations currently '
+                                  'require two StringDType arrays')
+        value_na_kind = _stringdtype_na_kind(value)
+        pattern_na_kind = _stringdtype_na_kind(pattern)
+        pattern_empty_null = value_na_kind == 0
+
+        if value.ndim == 0 and pattern.ndim == 0:
+            def impl(value, pattern, start=0, end=None):
+                start = start or s
+                end = e if end is None else end
+                allocators = stringdtype_acquire_allocators(value, pattern)
+                value_data = stringdtype_data_ptr(value)
+                pattern_data = stringdtype_data_ptr(pattern)
+                if use_na:
+                    value_na = stringdtype_na_name(value)
+                    pattern_na = stringdtype_na_name(pattern)
+                    if forward:
+                        found = stringdtype_find_na_data(
+                            value_data, 0, allocators[0], value_na_kind,
+                            value_na[0], value_na[1], pattern_data, 0,
+                            allocators[1], pattern_na_kind, pattern_na[0],
+                            pattern_na[1], pattern_empty_null, start, end)
+                    elif reverse:
+                        found = stringdtype_rfind_na_data(
+                            value_data, 0, allocators[0], value_na_kind,
+                            value_na[0], value_na[1], pattern_data, 0,
+                            allocators[1], pattern_na_kind, pattern_na[0],
+                            pattern_na[1], pattern_empty_null, start, end)
+                    else:
+                        found = stringdtype_count_na_data(
+                            value_data, 0, allocators[0], value_na_kind,
+                            value_na[0], value_na[1], pattern_data, 0,
+                            allocators[1], pattern_na_kind, pattern_na[0],
+                            pattern_na[1], pattern_empty_null, start, end)
+                elif forward:
+                    found = stringdtype_find_data(
+                        value_data, 0, allocators[0],
+                        pattern_data, 0, allocators[1],
+                        start, end,
+                    )
+                elif reverse:
+                    found = stringdtype_rfind_data(
+                        value_data, 0, allocators[0],
+                        pattern_data, 0, allocators[1],
+                        start, end,
+                    )
+                else:
+                    found = stringdtype_count_data(
+                        value_data, 0, allocators[0],
+                        pattern_data, 0, allocators[1],
+                        start, end,
+                    )
+                stringdtype_release_allocators(allocators)
+                return _stringdtype_search_result(found, raise_not_found)
+
+            return impl
+
+        def impl(value, pattern, start=0, end=None):
+            start = start or s
+            end = e if end is None else end
+            return _stringdtype_search_nd(
+                value, pattern, literally(use_na),
+                literally(value_na_kind), literally(pattern_na_kind),
+                literally(pattern_empty_null), start, end,
+                literally(search_op), literally(raise_not_found))
+
+        return impl
+
+    if op == 'find':
+        return ov_char_find(value, pattern, start, end)
+    if op == 'rfind':
+        return ov_char_rfind(value, pattern, start, end)
+    if op == 'index':
+        return ov_char_index(value, pattern, start, end)
+    if op == 'rindex':
+        return ov_char_rindex(value, pattern, start, end)
+    return ov_char_count(value, pattern, start, end)
+
+
+_CHAR_PREDICATE_OVERLOADS = {
+    'isalpha': ov_char_isalpha,
+    'isalnum': ov_char_isalnum,
+    'isdecimal': ov_char_isdecimal,
+    'isdigit': ov_char_isdigit,
+    'isnumeric': ov_char_isnumeric,
+    'isspace': ov_char_isspace,
+    'islower': ov_char_islower,
+    'isupper': ov_char_isupper,
+    'istitle': ov_char_istitle,
+}
+
+
+def _overload_predicate(value, op):
+    if not is_stringdtype_array_type(value):
+        return _CHAR_PREDICATE_OVERLOADS[op](value)
+
+    na_kind = value.dtype.na_kind
+    if op == 'isalpha':
+        op_code = _SDT_ISALPHA
+    elif op == 'isalnum':
+        op_code = _SDT_ISALNUM
+    elif op == 'isdecimal':
+        op_code = _SDT_ISDECIMAL
+    elif op == 'isdigit':
+        op_code = _SDT_ISDIGIT
+    elif op == 'isnumeric':
+        op_code = _SDT_ISNUMERIC
+    elif op == 'isspace':
+        op_code = _SDT_ISSPACE
+    elif op == 'islower':
+        op_code = _SDT_ISLOWER
+    elif op == 'isupper':
+        op_code = _SDT_ISUPPER
+    else:
+        op_code = _SDT_ISTITLE
+
+    if value.ndim > 0:
+        def impl(value):
+            return _stringdtype_predicate_nd(
+                value, literally(na_kind), literally(op_code))
+
+        return impl
+
+    _validate_stringdtype_array(value)
+
+    if value.ndim == 0:
+        if na_kind == 0:
+            def impl(value):
+                allocator = stringdtype_acquire_allocator(value)
+                data = stringdtype_data_ptr(value)
+                if op == 'isalpha':
+                    result = stringdtype_isalpha_data(data, 0, allocator)
+                elif op == 'isalnum':
+                    result = stringdtype_isalnum_data(data, 0, allocator)
+                elif op == 'isdecimal':
+                    result = stringdtype_isdecimal_data(data, 0, allocator)
+                elif op == 'isdigit':
+                    result = stringdtype_isdigit_data(data, 0, allocator)
+                elif op == 'isnumeric':
+                    result = stringdtype_isnumeric_data(data, 0, allocator)
+                elif op == 'isspace':
+                    result = stringdtype_isspace_data(data, 0, allocator)
+                elif op == 'islower':
+                    result = stringdtype_islower_data(data, 0, allocator)
+                elif op == 'isupper':
+                    result = stringdtype_isupper_data(data, 0, allocator)
+                else:
+                    result = stringdtype_istitle_data(data, 0, allocator)
+                stringdtype_release_allocator(allocator)
+                return result
+
+            return impl
+
+        def impl(value):
+            allocator = stringdtype_acquire_allocator(value)
+            data = stringdtype_data_ptr(value)
+            na_name = stringdtype_na_name(value)
+            if op == 'isalpha':
+                result = stringdtype_isalpha_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isalnum':
+                result = stringdtype_isalnum_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isdecimal':
+                result = stringdtype_isdecimal_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isdigit':
+                result = stringdtype_isdigit_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isnumeric':
+                result = stringdtype_isnumeric_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isspace':
+                result = stringdtype_isspace_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'islower':
+                result = stringdtype_islower_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            elif op == 'isupper':
+                result = stringdtype_isupper_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            else:
+                result = stringdtype_istitle_na_data(
+                    data, 0, allocator, na_kind, na_name[0], na_name[1])
+            stringdtype_release_allocator(allocator)
+            if result < 0:
+                raise ValueError(
+                    f'Cannot use the {op} function with a null that is '
+                    'not a nan-like value')
+            return bool(result)
+
+        return impl
+
+    raise NumbaValueError('unsupported StringDType array dimensionality')
+
+
+if _STRINGS is not None:
+    def _strings_count(value, sub, start=0, end=None):
+        return _STRINGS.count(value, sub, start, end)
+
+    def _strings_equal(left, right):
+        return _STRINGS.equal(left, right)
+
+    def _strings_find(value, sub, start=0, end=None):
+        return _STRINGS.find(value, sub, start, end)
+
+    def _strings_index(value, sub, start=0, end=None):
+        return _STRINGS.index(value, sub, start, end)
+
+    def _strings_not_equal(left, right):
+        return _STRINGS.not_equal(left, right)
+
+    def _strings_greater_equal(left, right):
+        return _STRINGS.greater_equal(left, right)
+
+    def _strings_greater(left, right):
+        return _STRINGS.greater(left, right)
+
+    def _strings_less(left, right):
+        return _STRINGS.less(left, right)
+
+    def _strings_less_equal(left, right):
+        return _STRINGS.less_equal(left, right)
+
+    def _strings_rfind(value, sub, start=0, end=None):
+        return _STRINGS.rfind(value, sub, start, end)
+
+    def _strings_rindex(value, sub, start=0, end=None):
+        return _STRINGS.rindex(value, sub, start, end)
+
+    def _strings_endswith(value, suffix, start=0, end=None):
+        return _STRINGS.endswith(value, suffix, start, end)
+
+    def _strings_startswith(value, prefix, start=0, end=None):
+        return _STRINGS.startswith(value, prefix, start, end)
+
+    def _strings_str_len(value):
+        return _STRINGS.str_len(value)
+
+    def _strings_isalpha(value):
+        return _STRINGS.isalpha(value)
+
+    def _strings_isalnum(value):
+        return _STRINGS.isalnum(value)
+
+    def _strings_isdecimal(value):
+        return _STRINGS.isdecimal(value)
+
+    def _strings_isdigit(value):
+        return _STRINGS.isdigit(value)
+
+    def _strings_islower(value):
+        return _STRINGS.islower(value)
+
+    def _strings_isnumeric(value):
+        return _STRINGS.isnumeric(value)
+
+    def _strings_isspace(value):
+        return _STRINGS.isspace(value)
+
+    def _strings_istitle(value):
+        return _STRINGS.istitle(value)
+
+    def _strings_isupper(value):
+        return _STRINGS.isupper(value)
+
+    _STRINGS_FUNCTIONS = {
+        **_CHAR_INFO_FUNCTIONS,
+        'count': _strings_count,
+        'endswith': _strings_endswith,
+        'equal': _strings_equal,
+        'find': _strings_find,
+        'index': _strings_index,
+        'not_equal': _strings_not_equal,
+        'greater_equal': _strings_greater_equal,
+        'greater': _strings_greater,
+        'isalnum': _strings_isalnum,
+        'isalpha': _strings_isalpha,
+        'isdecimal': _strings_isdecimal,
+        'isdigit': _strings_isdigit,
+        'islower': _strings_islower,
+        'isnumeric': _strings_isnumeric,
+        'isspace': _strings_isspace,
+        'istitle': _strings_istitle,
+        'isupper': _strings_isupper,
+        'less': _strings_less,
+        'less_equal': _strings_less_equal,
+        'rfind': _strings_rfind,
+        'rindex': _strings_rindex,
+        'startswith': _strings_startswith,
+        'str_len': _strings_str_len,
+    }
+
+    @infer_getattr
+    class _StringsModuleAttrs(AttributeTemplate):
+        key = types.Module(_STRINGS)
+
+        def generic_resolve(self, value, attr):
+            function = _STRINGS_FUNCTIONS.get(attr)
+            if function is not None:
+                return self.context.resolve_value_type(function)
+
+    @overload(_strings_equal, **OPTIONS)
+    def ov_strings_equal(left, right):
+        return _overload_equal(left, right, False)
+
+    @overload(_strings_count, **OPTIONS)
+    def ov_strings_count(value, sub, start=0, end=None):
+        return _overload_search(value, sub, start, end, 'count')
+
+    @overload(_strings_find, **OPTIONS)
+    def ov_strings_find(value, sub, start=0, end=None):
+        return _overload_search(value, sub, start, end, 'find')
+
+    @overload(_strings_index, **OPTIONS)
+    def ov_strings_index(value, sub, start=0, end=None):
+        return _overload_search(value, sub, start, end, 'index')
+
+    @overload(_strings_not_equal, **OPTIONS)
+    def ov_strings_not_equal(left, right):
+        return _overload_equal(left, right, True)
+
+    @overload(_strings_greater_equal, **OPTIONS)
+    def ov_strings_greater_equal(left, right):
+        return _overload_order(left, right, 'greater_equal')
+
+    @overload(_strings_greater, **OPTIONS)
+    def ov_strings_greater(left, right):
+        return _overload_order(left, right, 'greater')
+
+    @overload(_strings_less, **OPTIONS)
+    def ov_strings_less(left, right):
+        return _overload_order(left, right, 'less')
+
+    @overload(_strings_less_equal, **OPTIONS)
+    def ov_strings_less_equal(left, right):
+        return _overload_order(left, right, 'less_equal')
+
+    @overload(_strings_rfind, **OPTIONS)
+    def ov_strings_rfind(value, sub, start=0, end=None):
+        return _overload_search(value, sub, start, end, 'rfind')
+
+    @overload(_strings_rindex, **OPTIONS)
+    def ov_strings_rindex(value, sub, start=0, end=None):
+        return _overload_search(value, sub, start, end, 'rindex')
+
+    @overload(_strings_endswith, **OPTIONS)
+    def ov_strings_endswith(value, suffix, start=0, end=None):
+        return _overload_affix(value, suffix, start, end, True)
+
+    @overload(_strings_startswith, **OPTIONS)
+    def ov_strings_startswith(value, prefix, start=0, end=None):
+        return _overload_affix(value, prefix, start, end, False)
+
+    @overload(_strings_str_len, **OPTIONS)
+    def ov_strings_str_len(value):
+        if not is_stringdtype_array_type(value):
+            return ov_char_str_len(value)
+
+        na_kind = value.dtype.na_kind
+        if value.ndim > 0:
+            def impl(value):
+                return _stringdtype_str_len_nd(value, literally(na_kind))
+
+            return impl
+
+        _validate_stringdtype_array(value)
+
+        if value.ndim == 0:
+            if na_kind == 0:
+                def impl(value):
+                    allocator = stringdtype_acquire_allocator(value)
+                    length = stringdtype_codepoint_len_data(
+                        stringdtype_data_ptr(value), 0, allocator)
+                    stringdtype_release_allocator(allocator)
+                    if length < 0:
+                        raise ValueError(
+                            'The length of a null string is undefined')
+                    return length
+
+                return impl
+
+            def impl(value):
+                allocator = stringdtype_acquire_allocator(value)
+                na_name = stringdtype_na_name(value)
+                length = stringdtype_codepoint_len_na_data(
+                    stringdtype_data_ptr(value), 0, allocator, na_kind,
+                    na_name[0], na_name[1])
+                stringdtype_release_allocator(allocator)
+                if length < 0:
+                    raise ValueError(
+                        'The length of a null string is undefined')
+                return length
+
+            return impl
+
+        raise NumbaValueError('unsupported StringDType array dimensionality')
+
+    @overload(_strings_isalpha, **OPTIONS)
+    def ov_strings_isalpha(value):
+        return _overload_predicate(value, 'isalpha')
+
+    @overload(_strings_isalnum, **OPTIONS)
+    def ov_strings_isalnum(value):
+        return _overload_predicate(value, 'isalnum')
+
+    @overload(_strings_isdecimal, **OPTIONS)
+    def ov_strings_isdecimal(value):
+        return _overload_predicate(value, 'isdecimal')
+
+    @overload(_strings_isdigit, **OPTIONS)
+    def ov_strings_isdigit(value):
+        return _overload_predicate(value, 'isdigit')
+
+    @overload(_strings_islower, **OPTIONS)
+    def ov_strings_islower(value):
+        return _overload_predicate(value, 'islower')
+
+    @overload(_strings_isnumeric, **OPTIONS)
+    def ov_strings_isnumeric(value):
+        return _overload_predicate(value, 'isnumeric')
+
+    @overload(_strings_isspace, **OPTIONS)
+    def ov_strings_isspace(value):
+        return _overload_predicate(value, 'isspace')
+
+    @overload(_strings_istitle, **OPTIONS)
+    def ov_strings_istitle(value):
+        return _overload_predicate(value, 'istitle')
+
+    @overload(_strings_isupper, **OPTIONS)
+    def ov_strings_isupper(value):
+        return _overload_predicate(value, 'isupper')

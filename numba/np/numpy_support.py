@@ -104,6 +104,11 @@ def from_dtype(dtype):
     else:
         if char in 'SU':
             return _from_str_dtype(dtype)
+        if char == 'T':
+            from numba.np.strings._stringdtype_support import (
+                stringdtype_type_from_dtype,
+            )
+            return stringdtype_type_from_dtype(dtype)
         if char in 'mM':
             return _from_datetime_dtype(dtype)
         if char in 'V' and dtype.subdtype is not None:
@@ -140,6 +145,9 @@ def as_dtype(nbtype):
     if isinstance(nbtype, (types.CharSeq, types.UnicodeCharSeq)):
         letter = _as_dtype_letters[type(nbtype)]
         return np.dtype('%s%d' % (letter, nbtype.count))
+    from numba.np.strings._stringdtype_support import StringDTypePacket
+    if isinstance(nbtype, StringDTypePacket):
+        return np.dtype('T')
     if isinstance(nbtype, types.Record):
         return as_struct_dtype(nbtype)
     if isinstance(nbtype, types.EnumMember):
